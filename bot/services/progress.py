@@ -99,6 +99,7 @@ def build_pipeline_steps(agents_needed: list[str]) -> list[PipelineStep]:
         "frontend": "🎨 Frontend — Crafting the UI",
         "integrator": "🔗 Integrator — Wiring it together",
         "qa": "🔍 QA — Testing & polishing",
+        "updater": "🔧 Updater — Applying changes",
     }
 
     if agents_needed:

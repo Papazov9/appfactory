@@ -321,6 +321,210 @@ async def rebuild_project(bot: Bot, project: Project):
     asyncio.create_task(_run_pipeline(bot, project, estimate, tracker))
 
 
+async def update_project(
+    bot: Bot,
+    chat_id: int,
+    project_id: int,
+    instructions: str,
+):
+    """Update an existing project with new instructions, then redeploy."""
+    project = await db.get(project_id)
+    if not project:
+        await bot.send_message(chat_id=chat_id, text=f"Project #{project_id} not found.")
+        return
+
+    tracker = ProgressTracker(bot, project)
+
+    # Stop existing container (will be replaced)
+    docker_mgr = DockerManager(project, tracker)
+    if project.container_id or project.status == ProjectStatus.LIVE:
+        await docker_mgr.stop()
+
+    # Append update instructions to the brief for history
+    project.brief += f"\n\n--- UPDATE ---\n{instructions}"
+    project.status = ProjectStatus.BUILDING
+    project.error_log = ""
+    project.build_log = ""
+    project.container_id = ""
+    await db.save(project)
+
+    # The update uses a single "updater" agent — no need for full multi-agent pipeline
+    # since the code already exists
+    update_agents = ["updater"]
+
+    tracker.init_steps(update_agents)
+    step_est = tracker.get_step("estimate")
+    if step_est:
+        step_est.done("Update")
+    step_appr = tracker.get_step("approval")
+    if step_appr:
+        step_appr.done("Update")
+
+    await tracker.send_initial()
+    asyncio.create_task(_run_update_pipeline(bot, project, instructions, tracker))
+
+
+async def _run_update_pipeline(bot: Bot, project: Project, instructions: str,
+                                tracker: ProgressTracker):
+    """Run a single updater agent on existing code, then redeploy."""
+    from bot.services.agent_builder import AgentTokens, BuildReport
+    import time
+    import os
+
+    report = BuildReport()
+
+    try:
+        project_dir = project.project_dir
+        if not project_dir.exists():
+            await tracker.fail(f"Project directory not found: {project_dir}")
+            return
+
+        # ── Run updater agent ────────────────────
+        await tracker.step_start("agent:updater", "Applying changes...")
+
+        tokens = AgentTokens(agent_name="updater")
+        start_time = time.time()
+
+        prompt = f"""You are updating an EXISTING project. The code is already written and was working.
+
+WORKING DIRECTORY: {project_dir}
+PORT: {project.port}
+
+The user wants these changes:
+{instructions}
+
+RULES:
+1. Read the existing code first to understand the current state
+2. Make ONLY the changes requested — don't rewrite everything
+3. Keep all existing functionality working
+4. If adding new features, integrate them with the existing code
+5. Update package.json/requirements.txt if new dependencies are needed
+6. Run `npm install` if you added new Node dependencies
+7. Make sure the app still starts correctly on port {project.port}
+
+⚠️ NEVER run `npm start`, `node server.js`, `python app.py`, or any long-running server command.
+
+ORIGINAL BRIEF:
+{project.brief}"""
+
+        cmd = [
+            "claude",
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--max-turns", "25",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+
+        env_vars = dict(os.environ)
+        if config.ANTHROPIC_API_KEY:
+            env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
+
+        tracker.log(f"🔧 Updater agent starting...")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(project_dir),
+            env=env_vars,
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(), timeout=600
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            await tracker.step_fail("agent:updater", "Timed out after 10 minutes")
+            await tracker.fail("Update agent timed out.")
+            return
+
+        tokens.duration_seconds = time.time() - start_time
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        # Parse tokens from stream-json output
+        import re
+        for line in reversed(stdout.strip().split("\n")):
+            try:
+                data = json.loads(line)
+                if data.get("type") == "result":
+                    usage = data.get("usage", {})
+                    tokens.input_tokens = usage.get("input_tokens", 0)
+                    tokens.output_tokens = usage.get("output_tokens", 0)
+                    break
+                if "usage" in data and data["usage"].get("input_tokens"):
+                    tokens.input_tokens = data["usage"]["input_tokens"]
+                    tokens.output_tokens = data["usage"].get("output_tokens", 0)
+                    break
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if not tokens.input_tokens:
+            tokens.output_tokens = len(stdout) // 4
+            tokens.input_tokens = len(prompt) // 4
+
+        tokens.calculate_cost()
+
+        if process.returncode != 0:
+            tokens.error = stderr[-500:] if stderr else f"Exit code {process.returncode}"
+            tokens.success = False
+            await tracker.step_fail("agent:updater", tokens.error[:100])
+            await tracker.fail(f"Update failed:\n{tokens.error[:500]}")
+            report.add(tokens)
+            return
+        else:
+            tokens.success = True
+            report.add(tokens)
+            await tracker.step_done("agent:updater",
+                                     f"Done in {tokens.duration_seconds:.0f}s | ${tokens.cost_usd:.3f}")
+            tracker.log(f"🔧 Updater finished: {tokens.input_tokens + tokens.output_tokens:,} tokens | ${tokens.cost_usd:.3f}")
+
+        # Save report
+        project.actual_cost_usd += report.total_cost_usd
+        project.total_input_tokens += report.total_input_tokens
+        project.total_output_tokens += report.total_output_tokens
+        await db.save(project)
+
+        # ── Redeploy: Docker + Tunnel ────────────
+        docker_mgr = DockerManager(project, tracker)
+        success = await docker_mgr.containerize_and_run()
+        if not success:
+            return
+
+        tunnel_mgr = TunnelManager(project, tracker)
+        url = await tunnel_mgr.setup_route()
+        if not url:
+            return
+
+        # Verify
+        await tracker.step_start("verify", f"Testing {url}...")
+        live = await _verify_live_url(url)
+        if live:
+            await tracker.step_done("verify", "URL responds OK")
+        else:
+            await tracker.step_done("verify", "URL not responding yet (DNS may need time)")
+
+        await tracker.complete(url)
+
+        await bot.send_message(
+            chat_id=project.telegram_chat_id,
+            text=(
+                f"📊 <b>Update Report</b>\n\n"
+                f"✅ <b>updater</b>: {tokens.input_tokens + tokens.output_tokens:,} tokens | "
+                f"${tokens.cost_usd:.3f} | {tokens.duration_seconds:.0f}s\n\n"
+                f"💰 <b>Total: ${tokens.cost_usd:.3f}</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.exception(f"Update pipeline failed for {project.slug}")
+        await tracker.fail(f"Update error: {str(e)}")
+
+
 async def scan_projects(bot: Bot, chat_id: int) -> str:
     """Scan the projects directory and Docker containers to discover/sync project state."""
     lines = ["🔍 <b>Project Scan Results</b>\n"]

@@ -13,8 +13,9 @@ from telegram.ext import (
 )
 
 from bot.config import config
-from bot.services.orchestrator import create_project
+from bot.services.orchestrator import create_project, update_project
 from bot.services.transcriber import Transcriber
+from bot.models.project import db
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ NAME, APP_TYPE, BRIEF = range(3)
 
 # Quick voice flow states
 VOICE_WAIT, VOICE_CONFIRM, VOICE_EDIT = 10, 11, 12
+
+# Update flow states
+UPDATE_SELECT, UPDATE_INSTRUCTIONS = 20, 21
 
 APP_TYPE_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -284,6 +288,134 @@ async def voice_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 # ──────────────────────────────────────────────
+#  /update flow: modify an existing project
+# ──────────────────────────────────────────────
+
+async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /update — pick a project then give instructions."""
+    # If they passed an ID directly: /update 3
+    if context.args:
+        try:
+            project_id = int(context.args[0])
+            project = await db.get(project_id)
+            if not project:
+                await update.message.reply_text(f"Project #{project_id} not found.")
+                return ConversationHandler.END
+            context.user_data["update_project_id"] = project.id
+            context.user_data["update_project_name"] = project.name
+            await update.message.reply_text(
+                f"📝 <b>Updating #{project.id} {project.name}</b>\n\n"
+                f"What changes do you want? Describe what to add, fix, or change.\n"
+                f"You can also send a 🎤 voice message.\n\n"
+                f"Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+            return UPDATE_INSTRUCTIONS
+        except ValueError:
+            pass
+
+    # No ID given — show project list to pick from
+    projects = await db.list_all()
+    if not projects:
+        await update.message.reply_text("No projects yet. Use /new to create one.")
+        return ConversationHandler.END
+
+    lines = ["🔧 <b>Update a project</b>\n\nPick a project by sending its <b>ID number</b>:\n"]
+    for p in projects:
+        icon = {"live": "🟢", "stopped": "⚪", "failed": "🔴"}.get(p.status.value, "🟡")
+        lines.append(f"{icon} <b>#{p.id}</b> — {p.name} ({p.status.value})")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+    return UPDATE_SELECT
+
+
+async def update_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picks which project to update."""
+    try:
+        project_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Send a project ID number. Example: 3")
+        return UPDATE_SELECT
+
+    project = await db.get(project_id)
+    if not project:
+        await update.message.reply_text(f"Project #{project_id} not found. Try again.")
+        return UPDATE_SELECT
+
+    context.user_data["update_project_id"] = project.id
+    context.user_data["update_project_name"] = project.name
+
+    await update.message.reply_text(
+        f"📝 <b>Updating #{project.id} {project.name}</b>\n\n"
+        f"What changes do you want? Describe what to add, fix, or change.\n"
+        f"You can also send a 🎤 voice message.\n\n"
+        f"Send /cancel to abort.",
+        parse_mode="HTML",
+    )
+    return UPDATE_INSTRUCTIONS
+
+
+async def update_instructions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive text instructions for updating a project."""
+    instructions = update.message.text.strip()
+    project_id = context.user_data.get("update_project_id")
+    project_name = context.user_data.get("update_project_name", "project")
+
+    await update.message.reply_text(
+        f"🔧 Updating <b>{project_name}</b> with your instructions...\n"
+        f"Progress updates below.",
+        parse_mode="HTML",
+    )
+
+    await update_project(
+        bot=context.bot,
+        chat_id=update.effective_chat.id,
+        project_id=project_id,
+        instructions=instructions,
+    )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def update_instructions_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive voice instructions for updating a project."""
+    msg = await update.message.reply_text("🎙️ Transcribing...")
+
+    transcript = await _handle_voice(update)
+    if not transcript:
+        await msg.edit_text("❌ Couldn't transcribe. Try again or send text.")
+        return UPDATE_INSTRUCTIONS
+
+    await msg.edit_text(
+        f"🎙️ <b>Transcription:</b>\n<i>{transcript[:500]}</i>",
+        parse_mode="HTML",
+    )
+
+    project_id = context.user_data.get("update_project_id")
+    project_name = context.user_data.get("update_project_name", "project")
+
+    await update.message.reply_text(
+        f"🔧 Updating <b>{project_name}</b> with your instructions...\n"
+        f"Progress updates below.",
+        parse_mode="HTML",
+    )
+
+    await update_project(
+        bot=context.bot,
+        chat_id=update.effective_chat.id,
+        project_id=project_id,
+        instructions=transcript,
+    )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
 #  Shared helpers
 # ──────────────────────────────────────────────
 
@@ -335,6 +467,24 @@ def get_conversation_handler() -> ConversationHandler:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="new_project",
+    )
+
+
+def get_update_conversation_handler() -> ConversationHandler:
+    """/update flow: pick project → give instructions → rebuild with changes."""
+    return ConversationHandler(
+        entry_points=[CommandHandler("update", update_start)],
+        states={
+            UPDATE_SELECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, update_select),
+            ],
+            UPDATE_INSTRUCTIONS: [
+                MessageHandler(filters.VOICE | filters.AUDIO, update_instructions_voice),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, update_instructions_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="update_flow",
     )
 
 

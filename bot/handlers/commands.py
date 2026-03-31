@@ -38,6 +38,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Create:</b>\n"
         "/new — New project (text brief)\n"
         "/voice — New project (voice message)\n\n"
+        "<b>Modify:</b>\n"
+        "/update &lt;id&gt; — Update a project with new instructions\n\n"
         "<b>Manage:</b>\n"
         "/approve &lt;id&gt; — Approve build after cost estimate\n"
         "/cancel_build &lt;id&gt; — Cancel a pending build\n"

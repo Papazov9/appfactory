@@ -27,7 +27,7 @@ from bot.handlers.commands import (
     cmd_cost,
     cmd_scan,
 )
-from bot.handlers.conversations import get_conversation_handler, get_voice_conversation_handler
+from bot.handlers.conversations import get_conversation_handler, get_voice_conversation_handler, get_update_conversation_handler
 
 # Configure logging
 logging.basicConfig(
@@ -68,6 +68,8 @@ def main():
     app.add_handler(get_conversation_handler())
     # Voice flow — catches /voice command AND standalone voice messages
     app.add_handler(get_voice_conversation_handler())
+    # Update flow — /update <id> or /update then pick
+    app.add_handler(get_update_conversation_handler())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
