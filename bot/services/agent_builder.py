@@ -376,6 +376,7 @@ class MultiAgentBuilder:
             "--dangerously-skip-permissions",
             "--max-turns", str(max_turns),
             "--output-format", "stream-json",
+            "--verbose",
         ]
 
         env_vars = dict(os.environ)
