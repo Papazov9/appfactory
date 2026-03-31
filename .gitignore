@@ -1,0 +1,9 @@
+.env
+data/
+projects/
+__pycache__/
+*.pyc
+*.pyo
+.appfactory_checkpoint.json
+/tmp/
+.claude/
