@@ -280,12 +280,12 @@ class MultiAgentBuilder:
         # Check for checkpoint — resume if previous build partially succeeded
         checkpoint = load_checkpoint(project_dir)
         skipped_agents = set()
-        if checkpoint and checkpoint.get("status") == "partial":
+        if checkpoint and checkpoint.get("status") in ("partial", "failed"):
             completed = set(checkpoint.get("report", {}).get("agents_completed", []))
-            agents_to_run = [a for a in agents_to_run if a not in completed]
-            skipped_agents = completed
-            if agents_to_run:
-                self.tracker.log(f"♻️ Resuming: skipping {', '.join(completed)}")
+            if completed:
+                agents_to_run = [a for a in agents_to_run if a not in completed]
+                skipped_agents = completed
+                self.tracker.log(f"♻️ Resuming from checkpoint: skipping {', '.join(sorted(completed))}")
                 logger.info(f"Resuming {self.project.slug}: skipping {completed}")
 
         # Mark skipped agents
