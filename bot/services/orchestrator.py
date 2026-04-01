@@ -327,7 +327,12 @@ async def update_project(
     project_id: int,
     instructions: str,
 ):
-    """Update an existing project with new instructions, then redeploy."""
+    """Update an existing project with new instructions, then redeploy.
+
+    Small updates (<500 words) use a single updater agent.
+    Large updates (>=500 words) go through the full multi-agent pipeline
+    with the update instructions merged into the brief.
+    """
     project = await db.get(project_id)
     if not project:
         await bot.send_message(chat_id=chat_id, text=f"Project #{project_id} not found.")
@@ -348,20 +353,41 @@ async def update_project(
     project.container_id = ""
     await db.save(project)
 
-    # The update uses a single "updater" agent — no need for full multi-agent pipeline
-    # since the code already exists
-    update_agents = ["updater"]
+    # Decide: small tweak vs major rewrite
+    word_count = len(instructions.split())
+    is_major = word_count >= 500
 
-    tracker.init_steps(update_agents)
-    step_est = tracker.get_step("estimate")
-    if step_est:
-        step_est.done("Update")
-    step_appr = tracker.get_step("approval")
-    if step_appr:
-        step_appr.done("Update")
+    if is_major:
+        # Major update — use full multi-agent pipeline with merged brief
+        tracker.log(f"📏 Large update detected ({word_count} words) — using full agent pipeline")
+        from bot.services.estimator import _heuristic_estimate
+        estimate = _heuristic_estimate(project.brief, project.app_type)
 
-    await tracker.send_initial()
-    asyncio.create_task(_run_update_pipeline(bot, project, instructions, tracker))
+        tracker.init_steps(estimate.agents_needed)
+        step_est = tracker.get_step("estimate")
+        if step_est:
+            step_est.done(f"Major update ({word_count} words)")
+        step_appr = tracker.get_step("approval")
+        if step_appr:
+            step_appr.done("Auto-approved (update)")
+
+        await tracker.send_initial()
+        asyncio.create_task(_run_pipeline(bot, project, estimate, tracker))
+    else:
+        # Small update — single updater agent
+        tracker.log(f"📏 Small update ({word_count} words) — using single updater agent")
+        update_agents = ["updater"]
+
+        tracker.init_steps(update_agents)
+        step_est = tracker.get_step("estimate")
+        if step_est:
+            step_est.done("Update")
+        step_appr = tracker.get_step("approval")
+        if step_appr:
+            step_appr.done("Update")
+
+        await tracker.send_initial()
+        asyncio.create_task(_run_update_pipeline(bot, project, instructions, tracker))
 
 
 async def _run_update_pipeline(bot: Bot, project: Project, instructions: str,
@@ -407,11 +433,16 @@ RULES:
 ORIGINAL BRIEF:
 {project.brief}"""
 
+        # Scale max-turns and timeout based on instruction size
+        word_count = len(instructions.split())
+        max_turns = min(50, max(25, word_count // 10))
+        timeout = min(1800, max(600, word_count * 3))  # 10min–30min
+
         cmd = [
             "claude",
             "-p", prompt,
             "--dangerously-skip-permissions",
-            "--max-turns", "25",
+            "--max-turns", str(max_turns),
             "--output-format", "stream-json",
             "--verbose",
         ]
@@ -420,7 +451,7 @@ ORIGINAL BRIEF:
         if config.ANTHROPIC_API_KEY:
             env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
 
-        tracker.log(f"🔧 Updater agent starting...")
+        tracker.log(f"🔧 Updater agent starting (max {max_turns} turns, {timeout // 60}min timeout)...")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -432,13 +463,13 @@ ORIGINAL BRIEF:
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=600
+                process.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            await tracker.step_fail("agent:updater", "Timed out after 10 minutes")
-            await tracker.fail("Update agent timed out.")
+            await tracker.step_fail("agent:updater", f"Timed out after {timeout // 60} minutes")
+            await tracker.fail(f"Update agent timed out after {timeout // 60} minutes.\nTip: very large changes should use /rebuild instead.")
             return
 
         tokens.duration_seconds = time.time() - start_time
@@ -446,7 +477,6 @@ ORIGINAL BRIEF:
         stderr = stderr_bytes.decode("utf-8", errors="replace")
 
         # Parse tokens from stream-json output
-        import re
         for line in reversed(stdout.strip().split("\n")):
             try:
                 data = json.loads(line)
