@@ -292,6 +292,9 @@ class MultiAgentBuilder:
         for agent_name in skipped_agents:
             await self.tracker.step_skip(f"agent:{agent_name}", "Completed in previous run")
 
+        # Agents that are optional — failure doesn't block the pipeline
+        optional_agents = {"qa"}
+
         for agent_name in agents_to_run:
             step_key = f"agent:{agent_name}"
             await self.tracker.step_start(step_key, "Running...")
@@ -314,15 +317,22 @@ class MultiAgentBuilder:
                 self.report.add(retry_tokens)
 
                 if not retry_tokens.success:
-                    save_checkpoint(project_dir, agent_name, "failed", self.report)
-                    error_msg = (
-                        f"Agent '{agent_name}' failed after retry.\n"
-                        f"Error: {retry_tokens.error[:300]}\n\n"
-                        f"Use /rebuild to try again (will resume from checkpoint)."
-                    )
-                    await self.tracker.step_fail(step_key, retry_tokens.error[:100])
-                    await self.tracker.fail(error_msg)
-                    return False
+                    if agent_name in optional_agents:
+                        # Optional agent — warn but continue
+                        self.tracker.log(f"⚠️ Optional agent '{agent_name}' failed — continuing without it")
+                        await self.tracker.step_done(step_key, f"⚠️ Skipped (failed but non-blocking)")
+                        save_checkpoint(project_dir, agent_name, "partial", self.report)
+                        continue
+                    else:
+                        save_checkpoint(project_dir, agent_name, "failed", self.report)
+                        error_msg = (
+                            f"Agent '{agent_name}' failed after retry.\n"
+                            f"Error: {retry_tokens.error[:300]}\n\n"
+                            f"Use /rebuild to try again (will resume from checkpoint)."
+                        )
+                        await self.tracker.step_fail(step_key, retry_tokens.error[:100])
+                        await self.tracker.fail(error_msg)
+                        return False
 
             # Agent succeeded (possibly on retry)
             cost_str = f"${agent_tokens.cost_usd:.3f}" if agent_tokens.cost_usd else ""
@@ -359,16 +369,25 @@ class MultiAgentBuilder:
         if extra_context:
             prompt += extra_context
 
-        # Determine max turns based on agent type
+        # Determine max turns and timeout based on agent type
         agent_max_turns = {
             "architect": 15,
-            "backend": 25,
-            "database": 15,
-            "frontend": 25,
-            "integrator": 20,
-            "qa": 15,
+            "backend": 30,
+            "database": 20,
+            "frontend": 30,
+            "integrator": 25,
+            "qa": 20,
+        }
+        agent_timeouts = {
+            "architect": 600,
+            "backend": 900,
+            "database": 600,
+            "frontend": 900,
+            "integrator": 900,
+            "qa": 600,
         }
         max_turns = agent_max_turns.get(agent_name, 20)
+        timeout = agent_timeouts.get(agent_name, 600)
 
         cmd = [
             "claude",
@@ -383,7 +402,7 @@ class MultiAgentBuilder:
         if config.ANTHROPIC_API_KEY:
             env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
 
-        self.tracker.log(f"🤖 Agent '{agent_name}' starting (max {max_turns} turns)...")
+        self.tracker.log(f"🤖 Agent '{agent_name}' starting (max {max_turns} turns, {timeout // 60}min timeout)...")
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -449,16 +468,16 @@ class MultiAgentBuilder:
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             pass
 
-                await asyncio.wait_for(read_stream(), timeout=660)
+                await asyncio.wait_for(read_stream(), timeout=timeout + 60)
                 stderr_bytes = await process.stderr.read()
                 await process.wait()
 
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                tokens.error = f"Agent '{agent_name}' timed out after 10 minutes"
+                tokens.error = f"Agent '{agent_name}' timed out after {timeout // 60} minutes"
                 tokens.duration_seconds = time.time() - start_time
-                self.tracker.log(f"⏱️ Agent '{agent_name}' timed out")
+                self.tracker.log(f"⏱️ Agent '{agent_name}' timed out after {timeout // 60}min")
                 return tokens
 
             stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
@@ -501,7 +520,23 @@ class MultiAgentBuilder:
             tokens.calculate_cost()
 
             if process.returncode != 0:
-                tokens.error = stderr[-500:] if stderr else f"Exit code {process.returncode}"
+                # Capture the best available error info
+                error_parts = []
+                if stderr.strip():
+                    error_parts.append(stderr.strip()[-500:])
+                # Also check stdout for error JSON
+                for line in reversed(stdout.strip().split("\n")):
+                    try:
+                        data = json.loads(line)
+                        if data.get("type") == "result" and data.get("is_error"):
+                            error_parts.append(data.get("result", "")[:500])
+                            break
+                        if "error" in data:
+                            error_parts.append(str(data["error"])[:500])
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+                tokens.error = "\n".join(error_parts) if error_parts else f"Exit code {process.returncode}"
                 tokens.success = False
             else:
                 tokens.success = True
