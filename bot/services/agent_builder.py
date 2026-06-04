@@ -72,6 +72,7 @@ class AgentTokens:
     success: bool = False
     error: str = ""
     session_id: str = ""  # Claude Code session id (for cached-context updates)
+    files_written: list = field(default_factory=list)  # files this agent created/edited
 
     def calculate_cost(self):
         self.cost_usd = round(
@@ -244,7 +245,8 @@ CHECKPOINT_FILE = ".appfactory_checkpoint.json"
 
 
 def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: BuildReport,
-                    completed_agents: Optional[set] = None):
+                    completed_agents: Optional[set] = None,
+                    agent_progress: Optional[dict] = None):
     """Save build progress so we can resume on failure.
 
     `completed_agents` is the CUMULATIVE set of agents finished across all runs
@@ -253,6 +255,11 @@ def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: Bui
     skipped on resume, since this run's report only holds agents that actually
     ran this time. The fallback below preserves old behaviour for any caller
     that doesn't supply it.
+
+    `agent_progress` is per-agent breadcrumbs (files written, last error,
+    session id) for EVERY agent that has run — including failed/in-progress
+    ones — so a resumed agent can continue from its partial work instead of
+    regenerating it.
     """
     if completed_agents is None:
         completed_agents = [a.agent_name for a in report.agents if a.success]
@@ -266,9 +273,17 @@ def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: Bui
             "total_cost_usd": report.total_cost_usd,
             "agents_completed": sorted(set(completed_agents)),
         },
+        "agent_progress": agent_progress or {},
     }
-    checkpoint_path = project_dir / CHECKPOINT_FILE
-    checkpoint_path.write_text(json.dumps(checkpoint, indent=2))
+    # Write atomically (temp file + replace) so a crash mid-write can't leave a
+    # corrupt checkpoint, and never let a checkpoint write error kill the build.
+    try:
+        checkpoint_path = project_dir / CHECKPOINT_FILE
+        tmp_path = checkpoint_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(checkpoint, indent=2))
+        tmp_path.replace(checkpoint_path)
+    except Exception:
+        logger.exception("Failed to write checkpoint (continuing build)")
 
 
 def load_checkpoint(project_dir: Path) -> Optional[dict]:
@@ -311,13 +326,21 @@ class MultiAgentBuilder:
         # Check for checkpoint — resume if previous build partially succeeded
         checkpoint = load_checkpoint(project_dir)
         skipped_agents = set()
+        # Per-agent breadcrumbs from prior runs (files already written, last error,
+        # session id) so a resumed/retried agent continues instead of redoing work.
+        agent_progress: dict = {}
         if checkpoint and checkpoint.get("status") in ("partial", "failed"):
             completed = set(checkpoint.get("report", {}).get("agents_completed", []))
+            agent_progress = dict(checkpoint.get("agent_progress", {}))
             if completed:
                 agents_to_run = [a for a in agents_to_run if a not in completed]
                 skipped_agents = completed
                 self.tracker.log(f"♻️ Resuming from checkpoint: skipping {', '.join(sorted(completed))}")
                 logger.info(f"Resuming {self.project.slug}: skipping {completed}")
+            partial = [a for a in agents_to_run
+                       if agent_progress.get(a, {}).get("files")]
+            if partial:
+                self.tracker.log(f"↩️ Continuing partial work for: {', '.join(sorted(partial))}")
 
         # Cumulative set of agents finished across ALL runs of this build. Seed it
         # from the checkpoint's skipped agents so resumed runs don't forget prior
@@ -335,32 +358,57 @@ class MultiAgentBuilder:
             step_key = f"agent:{agent_name}"
             await self.tracker.step_start(step_key, "Running...")
 
-            agent_tokens = await self._run_agent(agent_name, project_dir)
+            # Persist file writes live, so even a hard crash mid-agent (OOM, bot
+            # restart) leaves a resumable checkpoint of what was already produced.
+            def _live_progress(files: list, session_id: str, _agent=agent_name):
+                self._record_progress(agent_progress, _agent, files, session_id,
+                                      status="running")
+                save_checkpoint(project_dir, _agent, "partial", self.report,
+                                completed_agents, agent_progress)
+
+            agent_tokens = await self._run_agent(
+                agent_name, project_dir,
+                extra_context=self._resume_context(agent_name, agent_progress),
+                on_progress=_live_progress,
+            )
             self.report.add(agent_tokens)
+            self._record_progress(agent_progress, agent_name, agent_tokens.files_written,
+                                  agent_tokens.session_id,
+                                  status="done" if agent_tokens.success else "failed",
+                                  error=agent_tokens.error)
 
             if not agent_tokens.success:
-                # Save checkpoint so we can resume later
-                save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
+                # Save the partial progress (files written so far) before retrying.
+                save_checkpoint(project_dir, agent_name, "partial", self.report,
+                                completed_agents, agent_progress)
 
-                # Try one retry with error context
+                # Retry — it receives the resume context (existing files + the
+                # error), so it continues rather than starting from scratch.
                 await self.tracker.step_start(step_key, "Retrying with error fix...")
                 self.tracker.log(f"⚠️ {agent_name} failed: {agent_tokens.error[:200]}")
 
                 retry_tokens = await self._run_agent(
                     agent_name, project_dir,
-                    extra_context=f"\n\nPREVIOUS ATTEMPT FAILED WITH:\n{agent_tokens.error}\n\nFix the issues and try again."
+                    extra_context=self._resume_context(agent_name, agent_progress),
+                    on_progress=_live_progress,
                 )
                 self.report.add(retry_tokens)
+                self._record_progress(agent_progress, agent_name, retry_tokens.files_written,
+                                      retry_tokens.session_id,
+                                      status="done" if retry_tokens.success else "failed",
+                                      error=retry_tokens.error)
 
                 if not retry_tokens.success:
                     if agent_name in optional_agents:
                         # Optional agent — warn but continue
                         self.tracker.log(f"⚠️ Optional agent '{agent_name}' failed — continuing without it")
                         await self.tracker.step_done(step_key, f"⚠️ Skipped (failed but non-blocking)")
-                        save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
+                        save_checkpoint(project_dir, agent_name, "partial", self.report,
+                                        completed_agents, agent_progress)
                         continue
                     else:
-                        save_checkpoint(project_dir, agent_name, "failed", self.report, completed_agents)
+                        save_checkpoint(project_dir, agent_name, "failed", self.report,
+                                        completed_agents, agent_progress)
                         error_msg = (
                             f"Agent '{agent_name}' failed after retry.\n"
                             f"Error: {retry_tokens.error[:300]}\n\n"
@@ -379,17 +427,70 @@ class MultiAgentBuilder:
 
             # Agent succeeded — record it in the cumulative set and checkpoint.
             completed_agents.add(agent_name)
-            save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
+            save_checkpoint(project_dir, agent_name, "partial", self.report,
+                            completed_agents, agent_progress)
 
         # All agents done
-        save_checkpoint(project_dir, "all", "complete", self.report, completed_agents)
+        save_checkpoint(project_dir, "all", "complete", self.report,
+                        completed_agents, agent_progress)
         return True
 
+    @staticmethod
+    def _record_progress(agent_progress: dict, agent_name: str, files, session_id: str = "",
+                         status: str = "running", error: str = ""):
+        """Merge an agent's latest progress into the cumulative breadcrumb map.
+
+        Files accumulate across attempts (they persist on disk), the most recent
+        session id wins, and a finished agent is never downgraded back to
+        "running" by a late callback.
+        """
+        prev = agent_progress.get(agent_name, {})
+        merged_files = sorted(set(prev.get("files", [])) | set(files or []))
+        if prev.get("status") == "done" and status == "running":
+            status = "done"
+        agent_progress[agent_name] = {
+            "status": status,
+            "files": merged_files,
+            "session_id": session_id or prev.get("session_id", ""),
+            "error": "" if status == "done" else (error or prev.get("error", ""))[:300],
+        }
+
+    def _resume_context(self, agent_name: str, agent_progress: dict) -> str:
+        """Build the extra prompt that tells a resumed/retried agent to continue
+        from its partial work instead of regenerating finished files."""
+        prog = agent_progress.get(agent_name)
+        if not prog or prog.get("status") == "done":
+            return ""
+        files = prog.get("files") or []
+        err = (prog.get("error") or "").strip()
+        if not files and not err:
+            return ""
+        parts = [
+            "\n\nRESUMING A PREVIOUS ATTEMPT — DO NOT START FROM SCRATCH.",
+            "An earlier run of this agent did not finish, but its work is already "
+            "saved in the project directory. Read what already exists, KEEP "
+            "whatever is correct, and only finish or fix what is incomplete — do "
+            "not regenerate files that are already done.",
+        ]
+        if files:
+            shown = ", ".join(files[:40])
+            more = "" if len(files) <= 40 else f" (+{len(files) - 40} more)"
+            parts.append(f"Files the previous attempt already created: {shown}{more}")
+        if err:
+            parts.append(f"The previous attempt ended with this error:\n{err}")
+        return "\n".join(parts)
+
     async def _run_agent(self, agent_name: str, project_dir: Path,
-                         extra_context: str = "") -> AgentTokens:
-        """Run a single specialist agent via Claude Code."""
+                         extra_context: str = "", on_progress=None) -> AgentTokens:
+        """Run a single specialist agent via Claude Code.
+
+        `on_progress(files, session_id)` (optional) is called whenever the agent
+        creates/edits a new file, so the caller can checkpoint partial work.
+        """
         tokens = AgentTokens(agent_name=agent_name)
         start_time = time.time()
+        # Defined up-front so it's always in scope for the return/except paths.
+        files_written = set()
 
         prompt_template = AGENT_PROMPTS.get(agent_name)
         if not prompt_template:
@@ -468,7 +569,6 @@ class MultiAgentBuilder:
             stdout_chunks = []
             last_update_time = 0
             tool_count = 0
-            files_written = set()
             current_action = ""
 
             try:
@@ -509,7 +609,18 @@ class MultiAgentBuilder:
                                             fpath = inp.get("file_path") or inp.get("path") or ""
                                             fname = Path(fpath).name if fpath else ""
                                             if tool_name in ("Write", "Edit", "NotebookEdit") and fname:
-                                                files_written.add(fname)
+                                                if fname not in files_written:
+                                                    files_written.add(fname)
+                                                    # Checkpoint partial work as each
+                                                    # new file lands (crash-safe resume).
+                                                    if on_progress:
+                                                        try:
+                                                            on_progress(sorted(files_written),
+                                                                        tokens.session_id)
+                                                        except Exception:
+                                                            logger.exception(
+                                                                "on_progress callback failed (continuing)"
+                                                            )
                                                 current_action = f"✍️ {fname}"
                                             elif tool_name == "Read" and fname:
                                                 current_action = f"📖 {fname}"
@@ -553,6 +664,7 @@ class MultiAgentBuilder:
                     f"(budget {timeout // 60} min, hang limit {AGENT_IDLE_TIMEOUT // 60} min)"
                 )
                 tokens.duration_seconds = time.time() - start_time
+                tokens.files_written = sorted(files_written)
                 self.tracker.log(f"⏱️ Agent '{agent_name}' timed out after {elapsed // 60}min")
                 return tokens
 
@@ -634,6 +746,8 @@ class MultiAgentBuilder:
             self.tracker.log(f"💥 Agent '{agent_name}' crashed: {e}")
             logger.exception(f"Agent '{agent_name}' crashed")
 
+        # Record the files this agent touched (used to resume partial work).
+        tokens.files_written = sorted(files_written)
         return tokens
 
     def get_report(self) -> BuildReport:
