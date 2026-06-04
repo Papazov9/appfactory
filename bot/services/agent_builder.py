@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 # Give the subprocess streams a generous 64 MB line buffer instead.
 STREAM_BUFFER_LIMIT = 64 * 1024 * 1024
 
+# How long an agent may stay COMPLETELY SILENT (no stream-json output at all)
+# before we treat it as hung and kill it. This must exceed the longest single
+# tool call an agent realistically makes — e.g. a full `mvn package`, `npm
+# install`, or test suite that prints nothing to our JSON stream until it
+# finishes. 25 minutes covers the slowest realistic build step. This is the
+# real hang detector; the per-agent wall-clock cap below is just a ceiling.
+AGENT_IDLE_TIMEOUT = 25 * 60
+
+# Per-agent wall-clock ceilings (seconds) BEFORE complexity scaling. A complex
+# or massive brief legitimately needs long steps, so these bases are multiplied
+# by COMPLEXITY_TIME_MULTIPLIER at runtime. Frontend/backend/integrator do the
+# heaviest work and get the largest bases.
+BASE_AGENT_TIMEOUTS = {
+    "architect": 900,    # 15 min
+    "backend": 1500,     # 25 min
+    "database": 900,     # 15 min
+    "frontend": 1500,    # 25 min
+    "integrator": 1500,  # 25 min
+    "qa": 900,           # 15 min
+}
+
+# Bigger projects get proportionally more wall-clock time per agent. A `complex`
+# backend step thus gets 1500 * 2.0 = 50 min, `massive` gets 75 min, before the
+# idle hang-detector or max-turns cap it.
+COMPLEXITY_TIME_MULTIPLIER = {
+    "trivial": 1.0,
+    "simple": 1.0,
+    "moderate": 1.5,
+    "complex": 2.0,
+    "massive": 3.0,
+}
+
 
 # ──────────────────────────────────────────────
 #  Token tracking
@@ -377,16 +409,15 @@ class MultiAgentBuilder:
             "integrator": 25,
             "qa": 20,
         }
-        agent_timeouts = {
-            "architect": 600,
-            "backend": 900,
-            "database": 600,
-            "frontend": 900,
-            "integrator": 900,
-            "qa": 600,
-        }
         max_turns = agent_max_turns.get(agent_name, 20)
-        timeout = agent_timeouts.get(agent_name, 600)
+
+        # Scale the per-agent wall-clock budget by project complexity so that a
+        # `complex`/`massive` brief isn't killed mid-step. The idle hang-detector
+        # (AGENT_IDLE_TIMEOUT) still catches genuinely stuck agents.
+        complexity = (self.estimate.complexity or self.project.complexity or "moderate").lower()
+        multiplier = COMPLEXITY_TIME_MULTIPLIER.get(complexity, 1.5)
+        base_timeout = BASE_AGENT_TIMEOUTS.get(agent_name, 900)
+        timeout = int(base_timeout * multiplier)
 
         cmd = [
             "claude",
@@ -401,7 +432,10 @@ class MultiAgentBuilder:
         if config.ANTHROPIC_API_KEY:
             env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
 
-        self.tracker.log(f"🤖 Agent '{agent_name}' starting (max {max_turns} turns, {timeout // 60}min timeout)...")
+        self.tracker.log(
+            f"🤖 Agent '{agent_name}' starting "
+            f"(max {max_turns} turns, {timeout // 60}min budget [{complexity}])..."
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -426,7 +460,7 @@ class MultiAgentBuilder:
                     while True:
                         try:
                             line = await asyncio.wait_for(
-                                process.stdout.readline(), timeout=660
+                                process.stdout.readline(), timeout=AGENT_IDLE_TIMEOUT
                             )
                         except ValueError:
                             # One stream-json line still exceeded the (64 MB) buffer.
@@ -494,9 +528,15 @@ class MultiAgentBuilder:
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                tokens.error = f"Agent '{agent_name}' timed out after {timeout // 60} minutes"
+                elapsed = int(time.time() - start_time)
+                # Either the agent went silent for AGENT_IDLE_TIMEOUT (hung) or it
+                # exceeded its complexity-scaled wall-clock budget.
+                tokens.error = (
+                    f"Agent '{agent_name}' timed out after {elapsed // 60} min "
+                    f"(budget {timeout // 60} min, hang limit {AGENT_IDLE_TIMEOUT // 60} min)"
+                )
                 tokens.duration_seconds = time.time() - start_time
-                self.tracker.log(f"⏱️ Agent '{agent_name}' timed out after {timeout // 60}min")
+                self.tracker.log(f"⏱️ Agent '{agent_name}' timed out after {elapsed // 60}min")
                 return tokens
 
             stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
