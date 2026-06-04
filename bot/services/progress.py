@@ -131,6 +131,7 @@ class ProgressTracker:
         self.project = project
         self.steps: list[PipelineStep] = []
         self._pipeline_started_at: Optional[float] = None
+        self._last_text: Optional[str] = None
 
     def init_steps(self, agents_needed: list[str]):
         """Initialize pipeline steps once we know which agents will run."""
@@ -273,10 +274,12 @@ class ProgressTracker:
     # ── Message formatting ───────────────────
 
     async def _update_message(self):
-        """Edit the Telegram progress message."""
+        """Edit the Telegram progress message (skips no-op edits)."""
         if not self.project.telegram_progress_msg_id:
             return
         text = self._format_message()
+        if text == self._last_text:
+            return  # nothing changed — avoid a redundant API call / "not modified"
         try:
             await self.bot.edit_message_text(
                 chat_id=self.project.telegram_chat_id,
@@ -284,6 +287,7 @@ class ProgressTracker:
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
+            self._last_text = text
         except Exception as e:
             logger.debug(f"Could not edit progress message: {e}")
 

@@ -15,6 +15,7 @@ from telegram.ext import (
 from bot.config import config
 from bot.services.orchestrator import create_project, update_project
 from bot.services.transcriber import Transcriber
+from bot.services import stacks
 from bot.models.project import db
 
 logger = logging.getLogger(__name__)
@@ -28,27 +29,25 @@ VOICE_WAIT, VOICE_CONFIRM, VOICE_EDIT = 10, 11, 12
 # Update flow states
 UPDATE_SELECT, UPDATE_INSTRUCTIONS = 20, 21
 
-APP_TYPE_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["🌐 Full-Stack Web App", "📄 Landing Page"],
-        ["📊 Dashboard", "📁 Static Site"],
-    ],
+STACK_KEYBOARD = ReplyKeyboardMarkup(
+    stacks.keyboard_rows(),
     one_time_keyboard=True,
     resize_keyboard=True,
 )
-
-APP_TYPE_MAP = {
-    "🌐 Full-Stack Web App": "fullstack",
-    "📄 Landing Page": "landing",
-    "📊 Dashboard": "dashboard",
-    "📁 Static Site": "static",
-}
 
 CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
     [["✅ Build it!", "✏️ Edit brief", "🔄 Change type", "❌ Cancel"]],
     one_time_keyboard=True,
     resize_keyboard=True,
 )
+
+# Shown while collecting a (possibly multi-message) brief or update instructions.
+COLLECT_KEYBOARD = ReplyKeyboardMarkup(
+    [["✅ Done", "❌ Cancel"]],
+    resize_keyboard=True,
+)
+DONE_WORDS = {"✅ Done", "Done", "done", "🚀 Build it!"}
+CANCEL_WORDS = {"❌ Cancel", "Cancel", "cancel"}
 
 
 # ──────────────────────────────────────────────
@@ -68,86 +67,127 @@ async def new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["project_name"] = update.message.text.strip()
     await update.message.reply_text(
-        "What type of application?",
-        reply_markup=APP_TYPE_KEYBOARD,
+        "Which stack should I build it in?",
+        reply_markup=STACK_KEYBOARD,
     )
     return APP_TYPE
 
 
 async def receive_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = update.message.text.strip()
-    app_type = APP_TYPE_MAP.get(choice, "fullstack")
-    context.user_data["app_type"] = app_type
+    stack = stacks.stack_from_keyboard(choice)
+    context.user_data["stack"] = stack
 
+    context.user_data["parts"] = []
+    context.user_data["images"] = []
     await update.message.reply_text(
         "Now send me the project brief.\n\n"
-        "You can send:\n"
-        "• A text description\n"
-        "• A 🎤 <b>voice message</b> (I'll transcribe it!)\n"
-        "• An audio file of a recorded meeting\n\n"
-        "The more detail, the better. Send /cancel to abort.",
-        reply_markup=ReplyKeyboardRemove(),
+        "You can send <b>several messages</b> — text, 🎤 voice notes, and 🖼️ images "
+        "(screenshots, mockups, branding). I'll combine them all.\n\n"
+        "Tap <b>✅ Done</b> when you've sent everything.",
+        reply_markup=COLLECT_KEYBOARD,
         parse_mode="HTML",
     )
     return BRIEF
 
 
-async def receive_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    brief = update.message.text.strip()
+def _collected_summary(context: ContextTypes.DEFAULT_TYPE) -> str:
+    parts = context.user_data.get("parts", [])
+    images = context.user_data.get("images", [])
+    bits = []
+    if parts:
+        bits.append(f"{len(parts)} text part(s)")
+    if images:
+        bits.append(f"{len(images)} image(s)")
+    return ", ".join(bits) if bits else "nothing yet"
+
+
+async def _finalize_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parts = context.user_data.get("parts", [])
+    images = context.user_data.get("images", [])
+    brief = "\n\n".join(parts).strip()
+    if not brief and not images:
+        await update.message.reply_text("Send a description or an image first, then tap ✅ Done.")
+        return BRIEF
+    if not brief:
+        brief = "Build according to the attached design reference image(s)."
+
     name = context.user_data.get("project_name", "unnamed")
-    app_type = context.user_data.get("app_type", "fullstack")
+    stack = context.user_data.get("stack", stacks.DEFAULT_STACK)
 
     await update.message.reply_text(
         f"🚀 Starting build for <b>{name}</b>...\n"
-        f"Type: {app_type}\n\n"
-        "I'll send you progress updates below.",
+        f"Stack: {stacks.stack_display(stack)}"
+        + (f"\n🖼️ {len(images)} reference image(s) attached" if images else "")
+        + "\n\nProgress updates below.",
         parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
-
     await create_project(
         bot=context.bot,
         chat_id=update.effective_chat.id,
         name=name,
         brief=brief,
-        app_type=app_type,
+        stack=stack,
+        images=images,
     )
-
     context.user_data.clear()
     return ConversationHandler.END
 
 
+async def receive_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text in DONE_WORDS:
+        return await _finalize_new(update, context)
+    if text in CANCEL_WORDS:
+        return await cancel(update, context)
+
+    context.user_data.setdefault("parts", []).append(text)
+    await update.message.reply_text(
+        f"📝 Added. Collected so far: {_collected_summary(context)}.\n"
+        "Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
+    )
+    return BRIEF
+
+
 async def receive_brief_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = await update.message.reply_text("🎙️ Transcribing your voice message...")
-
     transcript = await _handle_voice(update)
     if not transcript:
         await msg.edit_text("❌ Couldn't transcribe. Try again or send text instead.")
         return BRIEF
 
+    context.user_data.setdefault("parts", []).append(transcript)
     await msg.edit_text(
-        f"🎙️ <b>Transcription:</b>\n\n<i>{transcript[:800]}"
-        f"{'...' if len(transcript) > 800 else ''}</i>",
+        f"🎙️ <b>Transcribed:</b> <i>{transcript[:300]}"
+        f"{'...' if len(transcript) > 300 else ''}</i>",
         parse_mode="HTML",
     )
+    await update.message.reply_text(
+        f"Collected so far: {_collected_summary(context)}. Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
+    )
+    return BRIEF
 
-    name = context.user_data.get("project_name", "unnamed")
-    app_type = context.user_data.get("app_type", "fullstack")
+
+async def receive_brief_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    path = await _handle_photo(update)
+    if not path:
+        await update.message.reply_text("❌ Couldn't read that image. Try again.")
+        return BRIEF
+
+    context.user_data.setdefault("images", []).append(path)
+    caption = (update.message.caption or "").strip()
+    if caption:
+        context.user_data.setdefault("parts", []).append(caption)
 
     await update.message.reply_text(
-        f"🚀 Starting build for <b>{name}</b>...\nType: {app_type}",
-        parse_mode="HTML",
+        f"🖼️ Image added. Collected so far: {_collected_summary(context)}.\n"
+        "Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
     )
-
-    await create_project(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        name=name,
-        brief=transcript,
-        app_type=app_type,
-    )
-
-    context.user_data.clear()
-    return ConversationHandler.END
+    return BRIEF
 
 
 # ──────────────────────────────────────────────
@@ -193,19 +233,21 @@ async def voice_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # Store extracted data
     context.user_data["project_name"] = extracted.get("project_name", "voice-project")
-    context.user_data["app_type"] = extracted.get("app_type", "fullstack")
+    context.user_data["stack"] = stacks.normalize_stack(
+        extracted.get("stack") or extracted.get("app_type") or ""
+    )
     context.user_data["brief"] = extracted.get("brief", transcript)
     context.user_data["raw_transcript"] = transcript
 
     summary = extracted.get("summary", transcript[:200])
     name = context.user_data["project_name"]
-    app_type = context.user_data["app_type"]
+    stack = context.user_data["stack"]
     brief_preview = context.user_data["brief"][:400]
 
     await msg.edit_text(
         f"🎯 <b>Here's what I extracted:</b>\n\n"
         f"📛 <b>Project:</b> {name}\n"
-        f"📦 <b>Type:</b> {app_type}\n"
+        f"🧱 <b>Stack:</b> {stacks.stack_display(stack)}\n"
         f"📝 <b>Summary:</b> {summary}\n\n"
         f"<b>Brief:</b>\n<i>{brief_preview}{'...' if len(context.user_data['brief']) > 400 else ''}</i>",
         parse_mode="HTML",
@@ -223,11 +265,11 @@ async def voice_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if choice == "✅ Build it!":
         name = context.user_data.get("project_name", "voice-project")
-        app_type = context.user_data.get("app_type", "fullstack")
+        stack = context.user_data.get("stack", stacks.DEFAULT_STACK)
         brief = context.user_data.get("brief", "")
 
         await update.message.reply_text(
-            f"🚀 Building <b>{name}</b>...\nType: {app_type}\n\nProgress updates below.",
+            f"🚀 Building <b>{name}</b>...\nStack: {stacks.stack_display(stack)}\n\nProgress updates below.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -237,7 +279,7 @@ async def voice_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=update.effective_chat.id,
             name=name,
             brief=brief,
-            app_type=app_type,
+            stack=stack,
         )
         context.user_data.clear()
         return ConversationHandler.END
@@ -251,8 +293,8 @@ async def voice_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif choice == "🔄 Change type":
         await update.message.reply_text(
-            "Pick the app type:",
-            reply_markup=APP_TYPE_KEYBOARD,
+            "Pick the stack:",
+            reply_markup=STACK_KEYBOARD,
         )
         # After they pick, we go back to VOICE_CONFIRM via voice_retype
         return APP_TYPE
@@ -277,10 +319,10 @@ async def voice_edit_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def voice_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = update.message.text.strip()
-    app_type = APP_TYPE_MAP.get(choice, context.user_data.get("app_type", "fullstack"))
-    context.user_data["app_type"] = app_type
+    stack = stacks.stack_from_keyboard(choice)
+    context.user_data["stack"] = stack
     await update.message.reply_text(
-        f"Type → <b>{app_type}</b>. What next?",
+        f"Stack → <b>{stacks.stack_display(stack)}</b>. What next?",
         reply_markup=CONFIRM_KEYBOARD,
         parse_mode="HTML",
     )
@@ -303,11 +345,14 @@ async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 return ConversationHandler.END
             context.user_data["update_project_id"] = project.id
             context.user_data["update_project_name"] = project.name
+            context.user_data["parts"] = []
+            context.user_data["images"] = []
             await update.message.reply_text(
                 f"📝 <b>Updating #{project.id} {project.name}</b>\n\n"
-                f"What changes do you want? Describe what to add, fix, or change.\n"
-                f"You can also send a 🎤 voice message.\n\n"
-                f"Send /cancel to abort.",
+                f"Describe the changes — you can send <b>several messages</b>, "
+                f"🎤 voice notes, and 🖼️ images.\n\n"
+                f"Tap <b>✅ Done</b> when you're finished.",
+                reply_markup=COLLECT_KEYBOARD,
                 parse_mode="HTML",
             )
             return UPDATE_INSTRUCTIONS
@@ -347,72 +392,107 @@ async def update_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     context.user_data["update_project_id"] = project.id
     context.user_data["update_project_name"] = project.name
+    context.user_data["parts"] = []
+    context.user_data["images"] = []
 
     await update.message.reply_text(
         f"📝 <b>Updating #{project.id} {project.name}</b>\n\n"
-        f"What changes do you want? Describe what to add, fix, or change.\n"
-        f"You can also send a 🎤 voice message.\n\n"
-        f"Send /cancel to abort.",
+        f"Describe the changes — you can send <b>several messages</b>, "
+        f"🎤 voice notes, and 🖼️ images.\n\n"
+        f"Tap <b>✅ Done</b> when you're finished.",
+        reply_markup=COLLECT_KEYBOARD,
         parse_mode="HTML",
     )
     return UPDATE_INSTRUCTIONS
 
 
-async def update_instructions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive text instructions for updating a project."""
-    instructions = update.message.text.strip()
+async def _finalize_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parts = context.user_data.get("parts", [])
+    images = context.user_data.get("images", [])
+    instructions = "\n\n".join(parts).strip()
+    if not instructions and not images:
+        await update.message.reply_text("Describe the change or attach an image first, then tap ✅ Done.")
+        return UPDATE_INSTRUCTIONS
+    if not instructions:
+        instructions = "Apply the changes shown in the attached image(s)."
+
     project_id = context.user_data.get("update_project_id")
     project_name = context.user_data.get("update_project_name", "project")
 
     await update.message.reply_text(
-        f"🔧 Updating <b>{project_name}</b> with your instructions...\n"
-        f"Progress updates below.",
+        f"🔧 Updating <b>{project_name}</b>..."
+        + (f"\n🖼️ {len(images)} image(s) attached" if images else "")
+        + "\nProgress updates below.",
         parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
-
     await update_project(
         bot=context.bot,
         chat_id=update.effective_chat.id,
         project_id=project_id,
         instructions=instructions,
+        images=images,
     )
-
     context.user_data.clear()
     return ConversationHandler.END
 
 
-async def update_instructions_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive voice instructions for updating a project."""
-    msg = await update.message.reply_text("🎙️ Transcribing...")
+async def update_instructions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Collect text instructions for an update (multi-message)."""
+    text = update.message.text.strip()
+    if text in DONE_WORDS:
+        return await _finalize_update(update, context)
+    if text in CANCEL_WORDS:
+        return await cancel(update, context)
 
+    context.user_data.setdefault("parts", []).append(text)
+    await update.message.reply_text(
+        f"📝 Added. Collected so far: {_collected_summary(context)}.\n"
+        "Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
+    )
+    return UPDATE_INSTRUCTIONS
+
+
+async def update_instructions_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Collect voice instructions for an update."""
+    msg = await update.message.reply_text("🎙️ Transcribing...")
     transcript = await _handle_voice(update)
     if not transcript:
         await msg.edit_text("❌ Couldn't transcribe. Try again or send text.")
         return UPDATE_INSTRUCTIONS
 
+    context.user_data.setdefault("parts", []).append(transcript)
     await msg.edit_text(
-        f"🎙️ <b>Transcription:</b>\n<i>{transcript[:500]}</i>",
+        f"🎙️ <b>Transcribed:</b> <i>{transcript[:300]}"
+        f"{'...' if len(transcript) > 300 else ''}</i>",
         parse_mode="HTML",
     )
+    await update.message.reply_text(
+        f"Collected so far: {_collected_summary(context)}. Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
+    )
+    return UPDATE_INSTRUCTIONS
 
-    project_id = context.user_data.get("update_project_id")
-    project_name = context.user_data.get("update_project_name", "project")
+
+async def update_instructions_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Collect a reference image for an update."""
+    path = await _handle_photo(update)
+    if not path:
+        await update.message.reply_text("❌ Couldn't read that image. Try again.")
+        return UPDATE_INSTRUCTIONS
+
+    context.user_data.setdefault("images", []).append(path)
+    caption = (update.message.caption or "").strip()
+    if caption:
+        context.user_data.setdefault("parts", []).append(caption)
 
     await update.message.reply_text(
-        f"🔧 Updating <b>{project_name}</b> with your instructions...\n"
-        f"Progress updates below.",
-        parse_mode="HTML",
+        f"🖼️ Image added. Collected so far: {_collected_summary(context)}.\n"
+        "Send more, or tap ✅ Done.",
+        reply_markup=COLLECT_KEYBOARD,
     )
-
-    await update_project(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        project_id=project_id,
-        instructions=transcript,
-    )
-
-    context.user_data.clear()
-    return ConversationHandler.END
+    return UPDATE_INSTRUCTIONS
 
 
 # ──────────────────────────────────────────────
@@ -440,6 +520,23 @@ async def _handle_voice(update: Update) -> str | None:
         return None
 
 
+async def _handle_photo(update: Update) -> str | None:
+    """Download the largest size of a photo message to TEMP_DIR; return its path."""
+    photos = update.message.photo
+    if not photos:
+        return None
+    try:
+        config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        photo = photos[-1]  # highest resolution
+        file = await photo.get_file()
+        path = config.TEMP_DIR / f"img_{update.message.message_id}_{photo.file_unique_id}.jpg"
+        await file.download_to_drive(str(path))
+        return str(path)
+    except Exception:
+        logger.exception("Photo handling failed")
+        return None
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -461,6 +558,7 @@ def get_conversation_handler() -> ConversationHandler:
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
             APP_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_type)],
             BRIEF: [
+                MessageHandler(filters.PHOTO, receive_brief_photo),
                 MessageHandler(filters.VOICE | filters.AUDIO, receive_brief_voice),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_brief_text),
             ],
@@ -479,6 +577,7 @@ def get_update_conversation_handler() -> ConversationHandler:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, update_select),
             ],
             UPDATE_INSTRUCTIONS: [
+                MessageHandler(filters.PHOTO, update_instructions_photo),
                 MessageHandler(filters.VOICE | filters.AUDIO, update_instructions_voice),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, update_instructions_text),
             ],

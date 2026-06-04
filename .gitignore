@@ -7,3 +7,5 @@ __pycache__/
 .appfactory_checkpoint.json
 /tmp/
 .claude/
+.DS_Store
+**/.DS_Store

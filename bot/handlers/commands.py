@@ -11,6 +11,7 @@ from bot.models.project import db, ProjectStatus
 from bot.services.orchestrator import (
     stop_project, delete_project, rebuild_project,
     approve_project, cancel_pending, scan_projects,
+    create_repo, redeploy_project,
 )
 from bot.services.docker_manager import DockerManager
 from bot.services.progress import ProgressTracker
@@ -39,7 +40,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/new — New project (text brief)\n"
         "/voice — New project (voice message)\n\n"
         "<b>Modify:</b>\n"
-        "/update &lt;id&gt; — Update a project with new instructions\n\n"
+        "/update &lt;id&gt; — Change a project with AI (auto-commits to Git)\n\n"
+        "<b>Maintain via Git:</b>\n"
+        "/repo &lt;id&gt; — Create a private GitHub repo &amp; push the source\n"
+        "/redeploy &lt;id&gt; — Deploy the latest code pushed to GitHub\n\n"
         "<b>Manage:</b>\n"
         "/approve &lt;id&gt; — Approve build after cost estimate\n"
         "/cancel_build &lt;id&gt; — Cancel a pending build\n"
@@ -209,6 +213,41 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scanning projects directory and Docker containers...")
     result = await scan_projects(context.bot, update.effective_chat.id)
     await update.message.reply_text(result, parse_mode="HTML")
+
+
+@auth_check
+async def cmd_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /repo <id> — create a GitHub repo for the project and push its source."""
+    project = await _get_project_from_args(update, context)
+    if not project:
+        return
+
+    await update.message.reply_text(
+        f"📦 Creating GitHub repo for #{project.id} {project.name}..."
+    )
+    result = await create_repo(context.bot, project)
+    await update.message.reply_text(
+        result, parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+@auth_check
+async def cmd_redeploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /redeploy <id> — pull latest from Git and redeploy (no AI)."""
+    project = await _get_project_from_args(update, context)
+    if not project:
+        return
+
+    if not project.repo_full_name:
+        await update.message.reply_text(
+            f"#{project.id} has no GitHub repo yet. Run /repo {project.id} first."
+        )
+        return
+
+    await update.message.reply_text(
+        f"♻️ Redeploying #{project.id} {project.name} from Git...\nProgress updates below."
+    )
+    await redeploy_project(context.bot, project)
 
 
 async def _get_project_from_args(

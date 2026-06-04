@@ -61,6 +61,17 @@ class Project:
     total_output_tokens: int = 0
     complexity: str = ""
     build_report_json: str = ""  # JSON string of full build report
+    # Stack & database
+    stack: str = ""  # python | spring | angular | spring-angular
+    db_kind: str = "none"  # none | sqlite | postgres
+    # Git / GitHub source repo (source of truth once /repo is run)
+    repo_url: str = ""
+    repo_full_name: str = ""  # owner/name on GitHub
+    default_branch: str = "main"
+    # Build / runtime internals
+    claude_session_id: str = ""  # Claude Code session for cached-context updates
+    last_good_image: str = ""  # image tag of last healthy deploy (for rollback)
+    deploy_port_b: int = 0  # secondary port used during zero-downtime swaps
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     telegram_chat_id: int = 0
@@ -112,6 +123,14 @@ class ProjectDB:
                     total_output_tokens INTEGER DEFAULT 0,
                     complexity TEXT DEFAULT '',
                     build_report_json TEXT DEFAULT '',
+                    stack TEXT DEFAULT '',
+                    db_kind TEXT DEFAULT 'none',
+                    repo_url TEXT DEFAULT '',
+                    repo_full_name TEXT DEFAULT '',
+                    default_branch TEXT DEFAULT 'main',
+                    claude_session_id TEXT DEFAULT '',
+                    last_good_image TEXT DEFAULT '',
+                    deploy_port_b INTEGER DEFAULT 0,
                     created_at REAL,
                     updated_at REAL,
                     telegram_chat_id INTEGER DEFAULT 0,
@@ -126,6 +145,14 @@ class ProjectDB:
                 ("total_output_tokens", "INTEGER", "0"),
                 ("complexity", "TEXT", "''"),
                 ("build_report_json", "TEXT", "''"),
+                ("stack", "TEXT", "''"),
+                ("db_kind", "TEXT", "'none'"),
+                ("repo_url", "TEXT", "''"),
+                ("repo_full_name", "TEXT", "''"),
+                ("default_branch", "TEXT", "'main'"),
+                ("claude_session_id", "TEXT", "''"),
+                ("last_good_image", "TEXT", "''"),
+                ("deploy_port_b", "INTEGER", "0"),
             ]:
                 try:
                     await db.execute(
@@ -143,9 +170,11 @@ class ProjectDB:
                     (name, slug, brief, app_type, status, port, container_id,
                      url, error_log, build_log, estimated_cost_usd, actual_cost_usd,
                      total_input_tokens, total_output_tokens, complexity,
-                     build_report_json, created_at, updated_at,
+                     build_report_json, stack, db_kind, repo_url, repo_full_name,
+                     default_branch, claude_session_id, last_good_image, deploy_port_b,
+                     created_at, updated_at,
                      telegram_chat_id, telegram_progress_msg_id)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         project.name, project.slug, project.brief,
                         project.app_type, project.status.value, project.port,
@@ -153,7 +182,11 @@ class ProjectDB:
                         project.build_log, project.estimated_cost_usd,
                         project.actual_cost_usd, project.total_input_tokens,
                         project.total_output_tokens, project.complexity,
-                        project.build_report_json, project.created_at,
+                        project.build_report_json, project.stack, project.db_kind,
+                        project.repo_url, project.repo_full_name,
+                        project.default_branch, project.claude_session_id,
+                        project.last_good_image, project.deploy_port_b,
+                        project.created_at,
                         project.updated_at, project.telegram_chat_id,
                         project.telegram_progress_msg_id,
                     ),
@@ -167,6 +200,9 @@ class ProjectDB:
                     container_id=?, url=?, error_log=?, build_log=?,
                     estimated_cost_usd=?, actual_cost_usd=?, total_input_tokens=?,
                     total_output_tokens=?, complexity=?, build_report_json=?,
+                    stack=?, db_kind=?, repo_url=?, repo_full_name=?,
+                    default_branch=?, claude_session_id=?, last_good_image=?,
+                    deploy_port_b=?,
                     updated_at=?, telegram_chat_id=?, telegram_progress_msg_id=?
                     WHERE id=?""",
                     (
@@ -176,7 +212,12 @@ class ProjectDB:
                         project.build_log, project.estimated_cost_usd,
                         project.actual_cost_usd, project.total_input_tokens,
                         project.total_output_tokens, project.complexity,
-                        project.build_report_json, project.updated_at,
+                        project.build_report_json,
+                        project.stack, project.db_kind, project.repo_url,
+                        project.repo_full_name, project.default_branch,
+                        project.claude_session_id, project.last_good_image,
+                        project.deploy_port_b,
+                        project.updated_at,
                         project.telegram_chat_id, project.telegram_progress_msg_id,
                         project.id,
                     ),
@@ -261,6 +302,14 @@ class ProjectDB:
             total_output_tokens=row["total_output_tokens"] if "total_output_tokens" in row.keys() else 0,
             complexity=row["complexity"] if "complexity" in row.keys() else "",
             build_report_json=row["build_report_json"] if "build_report_json" in row.keys() else "",
+            stack=row["stack"] if "stack" in row.keys() else "",
+            db_kind=row["db_kind"] if "db_kind" in row.keys() else "none",
+            repo_url=row["repo_url"] if "repo_url" in row.keys() else "",
+            repo_full_name=row["repo_full_name"] if "repo_full_name" in row.keys() else "",
+            default_branch=row["default_branch"] if "default_branch" in row.keys() else "main",
+            claude_session_id=row["claude_session_id"] if "claude_session_id" in row.keys() else "",
+            last_good_image=row["last_good_image"] if "last_good_image" in row.keys() else "",
+            deploy_port_b=row["deploy_port_b"] if "deploy_port_b" in row.keys() else 0,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             telegram_chat_id=row["telegram_chat_id"],

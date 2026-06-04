@@ -26,6 +26,8 @@ from bot.handlers.commands import (
     cmd_cancel_build,
     cmd_cost,
     cmd_scan,
+    cmd_repo,
+    cmd_redeploy,
 )
 from bot.handlers.conversations import get_conversation_handler, get_voice_conversation_handler, get_update_conversation_handler
 
@@ -82,6 +84,8 @@ def main():
     app.add_handler(CommandHandler("cancel_build", cmd_cancel_build))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("repo", cmd_repo))
+    app.add_handler(CommandHandler("redeploy", cmd_redeploy))
 
     # Start polling
     logger.info("AppFactory Bot starting...")

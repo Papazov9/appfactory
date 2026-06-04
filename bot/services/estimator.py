@@ -7,8 +7,44 @@ from dataclasses import dataclass
 import httpx
 
 from bot.config import config
+from bot.services import stacks
+from bot.services import cost_calibration
 
 logger = logging.getLogger(__name__)
+
+
+def _tokens_for(stack: str, complexity: str, tier: dict):
+    """Calibrated token estimate when we have history, else the tier default.
+
+    Returns (input_tokens, output_tokens, note_or_None)."""
+    pred = cost_calibration.predict(stack, complexity)
+    if pred:
+        in_t, out_t, count = pred
+        return in_t, out_t, f"📈 Calibrated from {count} past {stacks.stack_display(stack)} build(s)"
+    return tier["input_tokens"], tier["output_tokens"], None
+
+
+def _select_agents(stack: str, brief: str, complexity: str) -> list[str]:
+    """Stack defines the maximal agent pipeline; prune steps the project doesn't need."""
+    agents = stacks.agents_for_stack(stack)
+    text = (brief or "").lower()
+    data_kw = [
+        "database", "db ", "persist", "store", "save", "crud", "users", "account",
+        "login", "auth", "sign in", "sign up", "record", "history", "post", "comment",
+        "order", "inventory", "catalog", "booking", "schedule", "payment", "cart", "profile",
+    ]
+    needs_data = any(k in text for k in data_kw)
+
+    selected = []
+    for a in agents:
+        if a == "database":
+            if stacks.default_db_for(stack) == "none":
+                continue  # Angular: no data layer
+            # Lightweight Python apps with no persistence need skip the dedicated DB agent.
+            if stack == stacks.STACK_PYTHON and complexity in ("trivial", "simple") and not needs_data:
+                continue
+        selected.append(a)
+    return selected
 
 # Approximate costs per 1M tokens (Sonnet 4)
 INPUT_COST_PER_1M = 3.00   # $3 per 1M input tokens
@@ -108,14 +144,15 @@ class CostEstimate:
         return "\n".join(lines)
 
 
-async def estimate_project(brief: str, app_type: str) -> CostEstimate:
+async def estimate_project(brief: str, stack: str) -> CostEstimate:
     """
     Use Claude API to analyze the brief and estimate complexity/cost.
     This is a lightweight call (~500 tokens) that saves money by right-sizing the build.
     """
+    stack = stacks.normalize_stack(stack)
     prompt = f"""Analyze this project brief and classify its complexity.
 
-APP TYPE: {app_type}
+STACK: {stacks.stack_display(stack)} — {stacks.stack_summary(stack)}
 
 BRIEF:
 {brief}
@@ -139,7 +176,7 @@ Classification guide:
     api_key = config.ANTHROPIC_API_KEY
     if not api_key:
         # Fallback: guess based on brief length and keywords
-        return _heuristic_estimate(brief, app_type)
+        return _heuristic_estimate(brief, stack)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -175,10 +212,13 @@ Classification guide:
 
         tier = COMPLEXITY_TIERS[complexity]
 
-        input_tokens = tier["input_tokens"]
-        output_tokens = tier["output_tokens"]
+        input_tokens, output_tokens, cal_note = _tokens_for(stack, complexity, tier)
         cost = (input_tokens / 1_000_000 * INPUT_COST_PER_1M) + \
                (output_tokens / 1_000_000 * OUTPUT_COST_PER_1M)
+
+        notes = list(parsed.get("risk_notes", []))
+        if cal_note:
+            notes.insert(0, cal_note)
 
         return CostEstimate(
             complexity=complexity,
@@ -187,29 +227,30 @@ Classification guide:
             estimated_input_tokens=input_tokens,
             estimated_output_tokens=output_tokens,
             estimated_cost_usd=round(cost, 2),
-            agents_needed=tier["agents_needed"],
+            agents_needed=_select_agents(stack, brief, complexity),
             max_turns=tier["max_turns"],
             estimated_minutes=tier["estimated_minutes"],
             features_detected=parsed.get("features", []),
-            tech_stack_suggestion=parsed.get("tech_stack", "Node.js + vanilla HTML"),
-            risk_notes=parsed.get("risk_notes", []),
+            tech_stack_suggestion=parsed.get("tech_stack") or stacks.stack_summary(stack),
+            risk_notes=notes,
         )
 
     except Exception as e:
         logger.warning(f"Estimation API call failed: {e}, using heuristic")
-        return _heuristic_estimate(brief, app_type)
+        return _heuristic_estimate(brief, stack)
 
 
-def _heuristic_estimate(brief: str, app_type: str) -> CostEstimate:
+def _heuristic_estimate(brief: str, stack: str) -> CostEstimate:
     """Fallback estimation based on brief length and keywords."""
+    stack = stacks.normalize_stack(stack)
     words = len(brief.split())
     keywords_complex = ["auth", "login", "database", "payment", "api", "admin",
                         "dashboard", "user management", "roles", "permissions"]
     complexity_score = sum(1 for k in keywords_complex if k in brief.lower())
 
-    if app_type == "static" or words < 30:
+    if words < 30:
         complexity = "trivial"
-    elif app_type == "landing" or words < 80:
+    elif words < 80:
         complexity = "simple"
     elif complexity_score >= 4 or words > 300:
         complexity = "complex"
@@ -219,10 +260,13 @@ def _heuristic_estimate(brief: str, app_type: str) -> CostEstimate:
         complexity = "simple"
 
     tier = COMPLEXITY_TIERS[complexity]
-    input_tokens = tier["input_tokens"]
-    output_tokens = tier["output_tokens"]
+    input_tokens, output_tokens, cal_note = _tokens_for(stack, complexity, tier)
     cost = (input_tokens / 1_000_000 * INPUT_COST_PER_1M) + \
            (output_tokens / 1_000_000 * OUTPUT_COST_PER_1M)
+
+    notes = ["Estimate is heuristic-based (API unavailable)"]
+    if cal_note:
+        notes.insert(0, cal_note)
 
     return CostEstimate(
         complexity=complexity,
@@ -231,10 +275,10 @@ def _heuristic_estimate(brief: str, app_type: str) -> CostEstimate:
         estimated_input_tokens=input_tokens,
         estimated_output_tokens=output_tokens,
         estimated_cost_usd=round(cost, 2),
-        agents_needed=tier["agents_needed"],
+        agents_needed=_select_agents(stack, brief, complexity),
         max_turns=tier["max_turns"],
         estimated_minutes=tier["estimated_minutes"],
         features_detected=[],
-        tech_stack_suggestion="Auto-detected",
-        risk_notes=["Estimate is heuristic-based (API unavailable)"],
+        tech_stack_suggestion=stacks.stack_summary(stack),
+        risk_notes=notes,
     )

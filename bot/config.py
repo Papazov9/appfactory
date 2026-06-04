@@ -34,6 +34,15 @@ class Config:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
+    # GitHub (per-project source repos)
+    GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
+    GITHUB_OWNER: str = os.getenv("GITHUB_OWNER", "")
+    GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com")
+    GIT_AUTHOR_NAME: str = os.getenv("GIT_AUTHOR_NAME", "AppFactory Bot")
+    GIT_AUTHOR_EMAIL: str = os.getenv(
+        "GIT_AUTHOR_EMAIL", "appfactory-bot@users.noreply.github.com"
+    )
+
     # Voice / Transcription
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")  # For Whisper API (optional)
     TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", "/tmp/appfactory"))
@@ -57,6 +66,11 @@ class Config:
         if not cls.TUNNEL_UUID:
             errors.append("TUNNEL_UUID is required")
         return errors
+
+    @property
+    def github_enabled(self) -> bool:
+        """True when GitHub repo creation/push is configured."""
+        return bool(self.GITHUB_TOKEN and self.GITHUB_OWNER)
 
 
 config = Config()

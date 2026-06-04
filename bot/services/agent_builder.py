@@ -14,6 +14,7 @@ from bot.config import config
 from bot.models.project import Project, ProjectStatus, db
 from bot.services.progress import ProgressTracker
 from bot.services.estimator import CostEstimate, INPUT_COST_PER_1M, OUTPUT_COST_PER_1M
+from bot.services import stacks
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class AgentTokens:
     duration_seconds: float = 0.0
     success: bool = False
     error: str = ""
+    session_id: str = ""  # Claude Code session id (for cached-context updates)
 
     def calculate_cost(self):
         self.cost_usd = round(
@@ -46,6 +48,7 @@ class BuildReport:
     total_output_tokens: int = 0
     total_cost_usd: float = 0.0
     total_duration_seconds: float = 0.0
+    last_session_id: str = ""  # most recent Claude session id seen
 
     def add(self, agent_tokens: AgentTokens):
         self.agents.append(agent_tokens)
@@ -53,6 +56,8 @@ class BuildReport:
         self.total_output_tokens += agent_tokens.output_tokens
         self.total_cost_usd += agent_tokens.cost_usd
         self.total_duration_seconds += agent_tokens.duration_seconds
+        if agent_tokens.session_id:
+            self.last_session_id = agent_tokens.session_id
 
     def format_telegram(self) -> str:
         lines = ["📊 <b>Build Report</b>\n"]
@@ -75,141 +80,117 @@ class BuildReport:
 # ──────────────────────────────────────────────
 
 AGENT_PROMPTS = {
-    "architect": """You are the ARCHITECT agent. Your job is to create a detailed technical plan.
+    "architect": """You are the ARCHITECT agent. Create a detailed technical plan.
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Given this project brief, create a PLAN.md file with:
-1. Project structure (every file that needs to be created)
-2. Tech stack decisions with reasoning
-3. Database schema (if needed)
-4. API endpoints (if needed)
-5. Component breakdown for frontend
-6. Data flow description
-7. Any third-party libraries needed (with exact package names)
+Given this brief, create a PLAN.md file with:
+1. Project structure — every file to create, in the idiomatic layout for this stack
+2. Library/dependency choices with exact package names and versions
+3. Data model / DB schema (only if the app needs persistence)
+4. API endpoints (if any)
+5. Frontend component breakdown (if any)
+6. Data flow
 
-Also create the directory structure with empty placeholder files.
-
-CRITICAL: The app MUST listen on port {port}. Use SQLite for any database needs.
-No external API keys — app must be self-contained with demo data.
-
-⚠️ NEVER run `npm start`, `node server.js`, `python app.py`, or any command that starts a server process. Only write files. The app will be started later in Docker.
-
-APP TYPE: {app_type}
+Also create the directory structure with placeholder files.
+The app must be self-contained: no external API keys, realistic demo data.
+Follow the STACK RULES below exactly.
 
 BRIEF:
 {brief}""",
 
-    "backend": """You are the BACKEND agent. Your job is to implement the server-side code.
+    "backend": """You are the BACKEND agent. Implement the server-side code.
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Read the PLAN.md file first to understand the architecture.
-Then implement ALL backend code:
-- Server setup (Express/Fastify for Node.js, or Flask/FastAPI for Python)
-- API routes and controllers
-- Database setup and models (SQLite)
-- Middleware (CORS, error handling, etc.)
-- Seed data / demo data
-- package.json or requirements.txt with ALL dependencies
+Read PLAN.md first. Then implement ALL backend code per the STACK RULES below:
+- App/server setup and the entry point
+- Routes/controllers and business logic
+- Data models & persistence (only if the app needs it)
+- The dependency manifest with EVERY dependency pinned
+- Demo/seed data so the app looks real and populated
 
-The server MUST listen on port {port} (or process.env.PORT).
-Include a working `npm start` or `python app.py` command in package.json/scripts.
-Make sure all imports and dependencies are correct.
-You may run `npm install` to install dependencies, but ⚠️ NEVER run `npm start`, `node server.js`, or any command that starts a long-running server process. Only write code files and install deps.
+You may install dependencies and run short syntax checks, but NEVER start a
+long-running server process — only write code files.
 
 BRIEF:
 {brief}""",
 
-    "database": """You are the DATABASE agent. Your job is to set up the data layer.
+    "database": """You are the DATABASE agent. Set up the data layer.
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Read the PLAN.md file. Focus on:
-- SQLite database schema creation
-- Migration/seed scripts
-- Data models and ORM setup
-- Demo/sample data that makes the app look real and populated
-- Database utility functions
+Read PLAN.md. Per the STACK RULES below, focus on:
+- Schema / entities / migrations
+- ORM or data-access setup
+- Realistic seed/demo data (names, dates, amounts that look like a real app)
+- Data-access helper functions
 
-Create realistic demo data — names, dates, amounts that look like a real app.
-All data must be self-contained (no external dependencies).
-
-⚠️ NEVER run `npm start`, `node server.js`, `python app.py`, or any command that starts a server process. Only write files and run setup scripts.
+All data must be self-contained. NEVER start a server process — only write
+files and run short setup/migration scripts.
 
 BRIEF:
 {brief}""",
 
-    "frontend": """You are the FRONTEND agent. Your job is to build a stunning, pixel-perfect UI.
+    "frontend": """You are the FRONTEND agent. Build a stunning, professional UI.
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Read the PLAN.md file. Build ALL frontend code:
-- Beautiful, modern, PROFESSIONAL design
-- NOT generic — this should look like a real product, not a template
-- Responsive layout that works on mobile and desktop
-- Smooth animations and micro-interactions
-- Proper typography with good font choices (Google Fonts)
-- A cohesive color palette that fits the brand/purpose
-- Loading states, empty states, error states
-- Icons (use Lucide, Heroicons, or similar CDN-based icons)
+Read PLAN.md. Build ALL frontend code in the stack's conventional structure:
+- Modern, PROFESSIONAL design — looks like a real product, not a template
+- Responsive across mobile and desktop
+- Smooth interactions, good typography, a cohesive palette
+- Loading, empty, and error states
+- Tasteful icons
 
-If React/Vue: Set up the full component tree with routing.
-If vanilla: Create clean HTML/CSS/JS with modern ES6+.
-
-Make it look AMAZING. Not generic Bootstrap. Not default Tailwind.
-Custom, thoughtful, pixel-perfect design.
-
-⚠️ NEVER run `npm start`, `node server.js`, or any command that starts a server process. Only write code files.
+Make it look AMAZING — custom and thoughtful, not generic Bootstrap.
+NEVER start a dev server — only write code files.
 
 BRIEF:
 {brief}""",
 
-    "integrator": """You are the INTEGRATOR agent. Your job is to wire everything together and fix issues.
+    "integrator": """You are the INTEGRATOR agent. Wire everything together and fix issues.
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Review ALL files in the project. Your tasks:
-1. Make sure frontend connects to backend API correctly
-2. Fix any import/require path issues
-3. Ensure all dependencies are in package.json / requirements.txt
-4. Fix any TypeScript/ESLint errors
-5. Make sure static files are served correctly
-6. Run `npm install` if package.json exists to verify deps install cleanly
-7. Fix any missing files referenced in code
-8. Verify server.js/app.js reads PORT from environment: process.env.PORT || {port}
+Review ALL files. Per the STACK RULES below:
+1. Ensure the frontend talks to the backend correctly (same-origin /api)
+2. Fix import/path/build issues
+3. Ensure every dependency is declared and the project builds cleanly
+4. Ensure the entry point reads PORT from the environment
+5. Fix any missing/broken references
 
-If you find issues, FIX them. Don't just report — fix the actual code.
-
-⚠️ CRITICAL: NEVER run `npm start`, `node server.js`, `python app.py`, or ANY command that starts a long-running server. The app will be started in Docker later. You may only run short commands like `npm install`, `node -e "..."` for syntax checks, etc.
+FIX issues directly — don't just report them. You may run short
+build/install/syntax-check commands, but NEVER start a long-running server.
 
 BRIEF:
 {brief}""",
 
-    "qa": """You are the QA agent. Your job is to review and polish the code.
+    "qa": """You are the QA agent. Review and polish by READING the code (do NOT start the server).
 
 WORKING DIRECTORY: {project_dir}
 PORT: {port}
+STACK: {stack}
 
-Final review pass. Check by READING the code (do NOT start the server):
-1. Does package.json have a valid "start" script?
-2. Does server.js/app.js use process.env.PORT || {port}?
-3. Are all imported modules listed in package.json dependencies?
-4. Is the HTML/CSS/JS well-formed and complete?
-5. Is the design polished? Fix any visual issues in the code.
-6. Is the demo data realistic and complete?
-7. Are there any broken references or missing files?
-8. Does the responsive design CSS look correct?
+Final pass, per the STACK RULES below:
+1. The project builds and its entry point binds to PORT (from env), on 0.0.0.0
+2. Every imported module is in the dependency manifest
+3. Code is complete and well-formed, with no broken references
+4. The design is polished; demo data is realistic and complete
+5. Fix any issues by editing the files directly
 
-Fix any issues you find by editing the files directly.
-The goal: production-quality code that will work when started in Docker.
-
-⚠️ CRITICAL: NEVER run `npm start`, `node server.js`, `python app.py`, or ANY command that starts a long-running server. Only read files, review code, and edit files to fix issues.
+Goal: production-quality code that works when started in Docker.
+NEVER start a long-running server — only read and edit files.
 
 BRIEF:
 {brief}""",
@@ -359,12 +340,23 @@ class MultiAgentBuilder:
             tokens.error = f"Unknown agent: {agent_name}"
             return tokens
 
+        stack = self.project.stack or stacks.normalize_stack(self.project.app_type)
         prompt = prompt_template.format(
             project_dir=str(project_dir),
             port=self.project.port,
-            app_type=self.project.app_type,
+            stack=stacks.stack_display(stack),
             brief=self.project.brief,
         )
+        prompt += "\n\n" + stacks.stack_rules(stack, self.project.port, self.project.db_kind)
+
+        # Point design-sensitive agents at any reference images the user attached.
+        refs_dir = project_dir / "design_refs"
+        if refs_dir.exists() and agent_name in ("architect", "frontend", "integrator", "qa"):
+            refs = sorted(p.name for p in refs_dir.iterdir() if p.is_file())
+            if refs:
+                prompt += ("\n\nDESIGN REFERENCES: ./design_refs/ contains user-provided image(s): "
+                           + ", ".join(refs[:10])
+                           + ". Use the Read tool to view them and match their layout, colours, and branding.")
 
         if extra_context:
             prompt += extra_context
@@ -418,10 +410,11 @@ class MultiAgentBuilder:
             last_update_time = 0
             tool_count = 0
             files_written = set()
+            current_action = ""
 
             try:
                 async def read_stream():
-                    nonlocal last_update_time, tool_count
+                    nonlocal last_update_time, tool_count, current_action
                     while True:
                         line = await asyncio.wait_for(
                             process.stdout.readline(), timeout=660
@@ -435,32 +428,40 @@ class MultiAgentBuilder:
                             event = json.loads(line.decode("utf-8", errors="replace"))
                             event_type = event.get("type", "")
 
-                            # Track tool use for progress
+                            # Track tool use for progress + the live "current action"
                             if event_type == "assistant" and "message" in event:
                                 msg = event["message"]
                                 if isinstance(msg, dict):
                                     for block in msg.get("content", []):
-                                        if isinstance(block, dict):
-                                            if block.get("type") == "tool_use":
-                                                tool_count += 1
-                                                tool_name = block.get("name", "")
-                                                if tool_name in ("Write", "Edit"):
-                                                    inp = block.get("input", {})
-                                                    fpath = inp.get("file_path", "")
-                                                    if fpath:
-                                                        fname = Path(fpath).name
-                                                        files_written.add(fname)
+                                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                                            tool_count += 1
+                                            tool_name = block.get("name", "")
+                                            inp = block.get("input", {}) if isinstance(block.get("input"), dict) else {}
+                                            fpath = inp.get("file_path") or inp.get("path") or ""
+                                            fname = Path(fpath).name if fpath else ""
+                                            if tool_name in ("Write", "Edit", "NotebookEdit") and fname:
+                                                files_written.add(fname)
+                                                current_action = f"✍️ {fname}"
+                                            elif tool_name == "Read" and fname:
+                                                current_action = f"📖 {fname}"
+                                            elif tool_name == "Bash":
+                                                current_action = "⚙️ shell command"
+                                            elif tool_name in ("Grep", "Glob"):
+                                                current_action = "🔎 searching"
+                                            elif tool_name:
+                                                current_action = tool_name
 
-                            # Update progress periodically (max every 5s)
+                            # Update progress responsively (min 2s between edits to
+                            # stay under Telegram's edit-rate limit).
                             now = time.time()
-                            if now - last_update_time >= 5:
+                            if now - last_update_time >= 2:
                                 last_update_time = now
                                 detail = f"{tool_count} actions"
-                                if files_written:
-                                    recent = list(files_written)[-3:]
-                                    detail += f" | {', '.join(recent)}"
-                                step_key = f"agent:{agent_name}"
-                                step = self.tracker.get_step(step_key)
+                                if current_action:
+                                    detail += f" · {current_action}"
+                                elif files_written:
+                                    detail += f" · {', '.join(list(files_written)[-2:])}"
+                                step = self.tracker.get_step(f"agent:{agent_name}")
                                 if step and step.status == "running":
                                     step.detail = detail
                                     await self.tracker._update_message()
@@ -495,6 +496,7 @@ class MultiAgentBuilder:
                         usage = data.get("usage", {})
                         tokens.input_tokens = usage.get("input_tokens", 0)
                         tokens.output_tokens = usage.get("output_tokens", 0)
+                        tokens.session_id = data.get("session_id", "") or tokens.session_id
                         break
                     # Also check nested structures
                     if "usage" in data:
