@@ -18,6 +18,13 @@ from bot.services import stacks
 
 logger = logging.getLogger(__name__)
 
+# The `claude` CLI emits one JSON object per line in stream-json mode. A single
+# line (e.g. a big PLAN.md Write or a large file Read echoed back) can far exceed
+# asyncio's default 64 KB StreamReader limit, which would raise
+# "Separator is found, but chunk is longer than limit" and kill the agent.
+# Give the subprocess streams a generous 64 MB line buffer instead.
+STREAM_BUFFER_LIMIT = 64 * 1024 * 1024
+
 
 # ──────────────────────────────────────────────
 #  Token tracking
@@ -403,6 +410,7 @@ class MultiAgentBuilder:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(project_dir),
                 env=env_vars,
+                limit=STREAM_BUFFER_LIMIT,
             )
 
             # Stream stdout for live progress updates
@@ -416,9 +424,19 @@ class MultiAgentBuilder:
                 async def read_stream():
                     nonlocal last_update_time, tool_count, current_action
                     while True:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(), timeout=660
-                        )
+                        try:
+                            line = await asyncio.wait_for(
+                                process.stdout.readline(), timeout=660
+                            )
+                        except ValueError:
+                            # One stream-json line still exceeded the (64 MB) buffer.
+                            # asyncio has already dropped it from the buffer, so just
+                            # skip this progress line and keep reading rather than
+                            # letting one giant line fail the whole agent.
+                            self.tracker.log(
+                                f"⚠️ Agent '{agent_name}': skipped an oversized output line"
+                            )
+                            continue
                         if not line:
                             break
                         stdout_chunks.append(line)
