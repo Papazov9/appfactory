@@ -243,8 +243,19 @@ BRIEF:
 CHECKPOINT_FILE = ".appfactory_checkpoint.json"
 
 
-def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: BuildReport):
-    """Save build progress so we can resume on failure."""
+def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: BuildReport,
+                    completed_agents: Optional[set] = None):
+    """Save build progress so we can resume on failure.
+
+    `completed_agents` is the CUMULATIVE set of agents finished across all runs
+    (including ones skipped via a previous checkpoint). It must be passed
+    explicitly — deriving it from `report.agents` alone loses agents that were
+    skipped on resume, since this run's report only holds agents that actually
+    ran this time. The fallback below preserves old behaviour for any caller
+    that doesn't supply it.
+    """
+    if completed_agents is None:
+        completed_agents = [a.agent_name for a in report.agents if a.success]
     checkpoint = {
         "last_completed_agent": agent_name,
         "status": status,
@@ -253,7 +264,7 @@ def save_checkpoint(project_dir: Path, agent_name: str, status: str, report: Bui
             "total_input_tokens": report.total_input_tokens,
             "total_output_tokens": report.total_output_tokens,
             "total_cost_usd": report.total_cost_usd,
-            "agents_completed": [a.agent_name for a in report.agents if a.success],
+            "agents_completed": sorted(set(completed_agents)),
         },
     }
     checkpoint_path = project_dir / CHECKPOINT_FILE
@@ -308,6 +319,11 @@ class MultiAgentBuilder:
                 self.tracker.log(f"♻️ Resuming from checkpoint: skipping {', '.join(sorted(completed))}")
                 logger.info(f"Resuming {self.project.slug}: skipping {completed}")
 
+        # Cumulative set of agents finished across ALL runs of this build. Seed it
+        # from the checkpoint's skipped agents so resumed runs don't forget prior
+        # progress when they write the next checkpoint.
+        completed_agents = set(skipped_agents)
+
         # Mark skipped agents
         for agent_name in skipped_agents:
             await self.tracker.step_skip(f"agent:{agent_name}", "Completed in previous run")
@@ -324,7 +340,7 @@ class MultiAgentBuilder:
 
             if not agent_tokens.success:
                 # Save checkpoint so we can resume later
-                save_checkpoint(project_dir, agent_name, "partial", self.report)
+                save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
 
                 # Try one retry with error context
                 await self.tracker.step_start(step_key, "Retrying with error fix...")
@@ -341,10 +357,10 @@ class MultiAgentBuilder:
                         # Optional agent — warn but continue
                         self.tracker.log(f"⚠️ Optional agent '{agent_name}' failed — continuing without it")
                         await self.tracker.step_done(step_key, f"⚠️ Skipped (failed but non-blocking)")
-                        save_checkpoint(project_dir, agent_name, "partial", self.report)
+                        save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
                         continue
                     else:
-                        save_checkpoint(project_dir, agent_name, "failed", self.report)
+                        save_checkpoint(project_dir, agent_name, "failed", self.report, completed_agents)
                         error_msg = (
                             f"Agent '{agent_name}' failed after retry.\n"
                             f"Error: {retry_tokens.error[:300]}\n\n"
@@ -361,11 +377,12 @@ class MultiAgentBuilder:
                 f"Done in {agent_tokens.duration_seconds:.0f}s {cost_str}".strip()
             )
 
-            # Checkpoint after each successful agent
-            save_checkpoint(project_dir, agent_name, "partial", self.report)
+            # Agent succeeded — record it in the cumulative set and checkpoint.
+            completed_agents.add(agent_name)
+            save_checkpoint(project_dir, agent_name, "partial", self.report, completed_agents)
 
         # All agents done
-        save_checkpoint(project_dir, "all", "complete", self.report)
+        save_checkpoint(project_dir, "all", "complete", self.report, completed_agents)
         return True
 
     async def _run_agent(self, agent_name: str, project_dir: Path,
