@@ -39,7 +39,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Create:</b>\n"
         "/new — New project (text brief)\n"
         "/voice — New project (voice message)\n"
-        "/import — Deploy an existing repo (just give a subdomain)\n\n"
+        "/import — Deploy an existing repo as-is (its Dockerfile or docker-compose)\n\n"
         "<b>Modify:</b>\n"
         "/update &lt;id&gt; — Change a project with AI (auto-commits to Git)\n\n"
         "<b>Maintain via Git:</b>\n"
@@ -171,7 +171,15 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # Section 3: Container logs (if container exists)
-    if project.container_id or project.status == ProjectStatus.LIVE:
+    if project.deploy_mode == "compose":
+        from bot.services.compose_manager import ComposeManager
+        tracker = ProgressTracker(context.bot, project)
+        container_logs = await ComposeManager(project, tracker).logs(tail=30)
+        if container_logs and container_logs != "No compose logs available.":
+            sections.append(
+                f"<b>🧩 Compose Logs</b> (last 30 lines):\n<pre>{container_logs[-1500:]}</pre>"
+            )
+    elif project.container_id or project.status == ProjectStatus.LIVE:
         tracker = ProgressTracker(context.bot, project)
         docker_mgr = DockerManager(project, tracker)
         container_logs = await docker_mgr.get_logs(tail=30)

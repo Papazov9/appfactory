@@ -64,6 +64,14 @@ class Project:
     # Stack & database
     stack: str = ""  # python | spring | angular | spring-angular
     db_kind: str = "none"  # none | sqlite | postgres
+    # Deployment mode — how this project is containerized & run.
+    #   ""          → AI-built project (bot generates the Dockerfile per stack)
+    #   "dockerfile"→ imported repo deployed via its own root Dockerfile (single container)
+    #   "compose"   → imported repo deployed via its own docker-compose (multi-service)
+    deploy_mode: str = ""
+    compose_file: str = ""        # repo-relative path to the compose file (compose mode)
+    web_service: str = ""         # compose service routed to the subdomain
+    web_container_port: int = 0   # that service's internal (container) port
     # Git / GitHub source repo (source of truth once /repo is run)
     repo_url: str = ""
     repo_full_name: str = ""  # owner/name on GitHub
@@ -125,6 +133,10 @@ class ProjectDB:
                     build_report_json TEXT DEFAULT '',
                     stack TEXT DEFAULT '',
                     db_kind TEXT DEFAULT 'none',
+                    deploy_mode TEXT DEFAULT '',
+                    compose_file TEXT DEFAULT '',
+                    web_service TEXT DEFAULT '',
+                    web_container_port INTEGER DEFAULT 0,
                     repo_url TEXT DEFAULT '',
                     repo_full_name TEXT DEFAULT '',
                     default_branch TEXT DEFAULT 'main',
@@ -147,6 +159,10 @@ class ProjectDB:
                 ("build_report_json", "TEXT", "''"),
                 ("stack", "TEXT", "''"),
                 ("db_kind", "TEXT", "'none'"),
+                ("deploy_mode", "TEXT", "''"),
+                ("compose_file", "TEXT", "''"),
+                ("web_service", "TEXT", "''"),
+                ("web_container_port", "INTEGER", "0"),
                 ("repo_url", "TEXT", "''"),
                 ("repo_full_name", "TEXT", "''"),
                 ("default_branch", "TEXT", "'main'"),
@@ -170,11 +186,12 @@ class ProjectDB:
                     (name, slug, brief, app_type, status, port, container_id,
                      url, error_log, build_log, estimated_cost_usd, actual_cost_usd,
                      total_input_tokens, total_output_tokens, complexity,
-                     build_report_json, stack, db_kind, repo_url, repo_full_name,
+                     build_report_json, stack, db_kind, deploy_mode, compose_file,
+                     web_service, web_container_port, repo_url, repo_full_name,
                      default_branch, claude_session_id, last_good_image, deploy_port_b,
                      created_at, updated_at,
                      telegram_chat_id, telegram_progress_msg_id)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         project.name, project.slug, project.brief,
                         project.app_type, project.status.value, project.port,
@@ -183,6 +200,8 @@ class ProjectDB:
                         project.actual_cost_usd, project.total_input_tokens,
                         project.total_output_tokens, project.complexity,
                         project.build_report_json, project.stack, project.db_kind,
+                        project.deploy_mode, project.compose_file,
+                        project.web_service, project.web_container_port,
                         project.repo_url, project.repo_full_name,
                         project.default_branch, project.claude_session_id,
                         project.last_good_image, project.deploy_port_b,
@@ -200,7 +219,8 @@ class ProjectDB:
                     container_id=?, url=?, error_log=?, build_log=?,
                     estimated_cost_usd=?, actual_cost_usd=?, total_input_tokens=?,
                     total_output_tokens=?, complexity=?, build_report_json=?,
-                    stack=?, db_kind=?, repo_url=?, repo_full_name=?,
+                    stack=?, db_kind=?, deploy_mode=?, compose_file=?,
+                    web_service=?, web_container_port=?, repo_url=?, repo_full_name=?,
                     default_branch=?, claude_session_id=?, last_good_image=?,
                     deploy_port_b=?,
                     updated_at=?, telegram_chat_id=?, telegram_progress_msg_id=?
@@ -213,7 +233,10 @@ class ProjectDB:
                         project.actual_cost_usd, project.total_input_tokens,
                         project.total_output_tokens, project.complexity,
                         project.build_report_json,
-                        project.stack, project.db_kind, project.repo_url,
+                        project.stack, project.db_kind,
+                        project.deploy_mode, project.compose_file,
+                        project.web_service, project.web_container_port,
+                        project.repo_url,
                         project.repo_full_name, project.default_branch,
                         project.claude_session_id, project.last_good_image,
                         project.deploy_port_b,
@@ -304,6 +327,10 @@ class ProjectDB:
             build_report_json=row["build_report_json"] if "build_report_json" in row.keys() else "",
             stack=row["stack"] if "stack" in row.keys() else "",
             db_kind=row["db_kind"] if "db_kind" in row.keys() else "none",
+            deploy_mode=row["deploy_mode"] if "deploy_mode" in row.keys() else "",
+            compose_file=row["compose_file"] if "compose_file" in row.keys() else "",
+            web_service=row["web_service"] if "web_service" in row.keys() else "",
+            web_container_port=row["web_container_port"] if "web_container_port" in row.keys() else 0,
             repo_url=row["repo_url"] if "repo_url" in row.keys() else "",
             repo_full_name=row["repo_full_name"] if "repo_full_name" in row.keys() else "",
             default_branch=row["default_branch"] if "default_branch" in row.keys() else "main",

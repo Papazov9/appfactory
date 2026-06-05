@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 from bot.config import config
-from bot.services.orchestrator import create_project, update_project, import_project
+from bot.services.orchestrator import create_project, update_project, begin_import, finish_import
 from bot.services.transcriber import Transcriber
 from bot.services import stacks
 from bot.models.project import db
@@ -30,7 +30,7 @@ VOICE_WAIT, VOICE_CONFIRM, VOICE_EDIT = 10, 11, 12
 UPDATE_SELECT, UPDATE_INSTRUCTIONS = 20, 21
 
 # Import flow states (adopt an existing repo for deployment)
-IMPORT_URL, IMPORT_NAME = 30, 31
+IMPORT_URL, IMPORT_NAME, IMPORT_WEB_SERVICE = 30, 31, 32
 
 STACK_KEYBOARD = ReplyKeyboardMarkup(
     stacks.keyboard_rows(),
@@ -524,8 +524,9 @@ async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "📥 <b>Import an existing repo</b>\n\n"
         "Send the <b>HTTPS Git URL</b> of a repo you've already built and committed.\n"
         "<i>(e.g. https://github.com/you/my-app)</i>\n\n"
-        "I'll clone it, detect the stack, add a Dockerfile if one's missing, "
-        "and deploy it — you only need to pick a subdomain next.",
+        "I deploy it <b>exactly as your repo defines it</b> — your "
+        "<code>docker-compose.yml</code> (multi-service) or root <code>Dockerfile</code> "
+        "(single container). No guessing, no generated files. You just pick a subdomain next.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -567,15 +568,75 @@ async def import_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     url = context.user_data.get("import_url", "")
     await update.message.reply_text(
-        f"📥 Importing <b>{name}</b> from\n<code>{url}</code>\n\nProgress updates below.",
+        f"🔎 Cloning & inspecting <code>{url}</code>...",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await import_project(
+
+    result = await begin_import(
         bot=context.bot,
         chat_id=update.effective_chat.id,
         name=name,
         repo_url=url,
+    )
+    outcome = result.get("outcome")
+
+    if outcome == "error":
+        await update.message.reply_text(
+            f"❌ {result.get('message', 'Could not import this repo.')}",
+            parse_mode="HTML",
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if outcome == "choose_web":
+        context.user_data["import_project_id"] = result["project_id"]
+        context.user_data["import_services"] = {
+            svc: port for svc, port in result["services"]
+        }
+        rows = [[svc] for svc, _ in result["services"]] + [["❌ Cancel"]]
+        await update.message.reply_text(
+            f"🧩 Found a docker-compose stack (<code>{result['compose_file']}</code>) with "
+            f"<b>several services that publish a port</b>.\n\n"
+            f"Which one is the public web entry point (the subdomain routes to it)?",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True),
+        )
+        return IMPORT_WEB_SERVICE
+
+    # outcome == "ready"
+    await update.message.reply_text(
+        f"📥 Deploying <b>{name}</b> — {result.get('summary', '')}\n\nProgress updates below.",
+        parse_mode="HTML",
+    )
+    await finish_import(bot=context.bot, project_id=result["project_id"])
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def import_choose_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    choice = update.message.text.strip()
+    if choice in CANCEL_WORDS:
+        return await cancel(update, context)
+
+    services = context.user_data.get("import_services", {})
+    if choice not in services:
+        await update.message.reply_text(
+            "Pick one of the listed services (or /cancel)."
+        )
+        return IMPORT_WEB_SERVICE
+
+    project_id = context.user_data.get("import_project_id")
+    await update.message.reply_text(
+        f"📥 Deploying — routing the subdomain to <code>{choice}</code>.\n\nProgress updates below.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await finish_import(
+        bot=context.bot,
+        project_id=project_id,
+        web_service=choice,
+        web_container_port=int(services[choice]),
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -683,6 +744,9 @@ def get_import_conversation_handler() -> ConversationHandler:
             ],
             IMPORT_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, import_receive_name),
+            ],
+            IMPORT_WEB_SERVICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_choose_web),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

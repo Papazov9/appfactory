@@ -17,6 +17,8 @@ from bot.services.estimator import estimate_project, CostEstimate
 from bot.services.progress import ProgressTracker
 from bot.services.tunnel_manager import TunnelManager
 from bot.services.git_manager import GitManager
+from bot.services.compose_manager import ComposeManager
+from bot.services import compose_manager as compose_mod
 from bot.services import stacks
 from bot.services import cost_calibration
 
@@ -268,7 +270,12 @@ async def deploy_project(bot: Bot, project: Project, tracker: ProgressTracker) -
     port, health-check it, flip the tunnel route, and only then retire the old
     container. If the new version fails to build or pass health checks, the live
     version is left untouched (rollback = do nothing).
+
+    Compose-mode imports are deployed via their own docker-compose instead.
     """
+    if project.deploy_mode == "compose":
+        return await deploy_compose(project, tracker)
+
     docker_mgr = DockerManager(project, tracker)
     tunnel_mgr = TunnelManager(project, tracker)
 
@@ -369,10 +376,17 @@ async def _verify_live_url(url: str, retries: int = 3) -> bool:
 async def stop_project(bot: Bot, project: Project):
     """Stop a running project."""
     tracker = ProgressTracker(bot, project)
-    docker_mgr = DockerManager(project, tracker)
     tunnel_mgr = TunnelManager(project, tracker)
 
-    await docker_mgr.stop()
+    if project.deploy_mode == "compose":
+        # Bring the stack down but keep named volumes (data survives).
+        await ComposeManager(project, tracker).down(volumes=False)
+        project.status = ProjectStatus.STOPPED
+        project.container_id = ""
+        await db.save(project)
+    else:
+        await DockerManager(project, tracker).stop()
+
     await tunnel_mgr.remove_route()
 
     project.status = ProjectStatus.STOPPED
@@ -382,11 +396,14 @@ async def stop_project(bot: Bot, project: Project):
 async def delete_project(bot: Bot, project: Project):
     """Stop and fully remove a project: containers, db, network, volumes, image, files."""
     tracker = ProgressTracker(bot, project)
-    docker_mgr = DockerManager(project, tracker)
     tunnel_mgr = TunnelManager(project, tracker)
 
     await tunnel_mgr.remove_route()
-    await docker_mgr.teardown()
+    if project.deploy_mode == "compose":
+        # Remove the whole stack: containers, networks, volumes, and built images.
+        await ComposeManager(project, tracker).down(volumes=True, rmi=True)
+    else:
+        await DockerManager(project, tracker).teardown()
 
     if project.project_dir.exists():
         shutil.rmtree(project.project_dir, ignore_errors=True)
@@ -493,45 +510,27 @@ async def _run_redeploy(bot: Bot, project: Project, tracker: ProgressTracker):
         await tracker.fail(f"Redeploy error: {e}")
 
 
-def _detect_db_kind(project_dir: Path) -> str:
-    """Infer a project's database from its committed files (for /import).
-
-    Scans the common manifest/config files for a postgres or sqlite reference
-    so we only provision (and inject env for) a database the app actually uses.
-    Returns 'postgres' | 'sqlite' | 'none'."""
-    candidates = [
-        "pom.xml", "build.gradle", "requirements.txt", "pyproject.toml",
-        "package.json", "app.py", "docker-compose.yml", "compose.yaml",
-        "src/main/resources/application.properties",
-        "src/main/resources/application.yml",
-        "src/main/resources/application.yaml",
-    ]
-    blob = ""
-    for rel in candidates:
-        p = project_dir / rel
-        if p.exists() and p.is_file():
-            try:
-                blob += p.read_text(encoding="utf-8", errors="replace").lower()
-            except Exception:
-                pass
-    if "postgres" in blob or "postgresql" in blob:
-        return "postgres"
-    if "sqlite" in blob:
-        return "sqlite"
-    return "none"
+async def _discard_import(project: Project):
+    """Remove a half-imported project (files + DB row) when there's nothing to deploy."""
+    try:
+        if project.project_dir.exists():
+            shutil.rmtree(project.project_dir, ignore_errors=True)
+    finally:
+        if project.id is not None:
+            await db.delete(project.id)
 
 
-async def import_project(
-    bot: Bot,
-    chat_id: int,
-    name: str,
-    repo_url: str,
-) -> Project:
-    """Adopt an existing Git repo and deploy it under a subdomain.
+async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict:
+    """Create the project, clone the repo, and detect HOW it wants to be deployed.
 
-    The only inputs are the repo URL and the subdomain name — the stack, DB and
-    Dockerfile are auto-detected/generated. Wires up Git tracking so the project
-    can afterwards be maintained with /redeploy and /update like any other.
+    Deploys nothing yet — returns the next step so the caller (the /import
+    conversation) can either start the deploy or ask which service is the web
+    entry point. Outcomes:
+      {"outcome": "ready",      "project_id", "mode", "summary"}
+      {"outcome": "choose_web", "project_id", "services": [(name, port), ...]}
+      {"outcome": "error",      "message"}                       # project discarded
+    The repo is deployed AS-IS — its own Dockerfile / docker-compose is the
+    source of truth. We never generate or inject deployment files.
     """
     slug = slugify(name)
     if await db.get_by_slug(slug):
@@ -539,27 +538,91 @@ async def import_project(
 
     port = await db.next_available_port()
     project = Project(
-        name=name,
-        slug=slug,
-        brief=f"Imported from {repo_url}",
-        stack="",
-        db_kind="none",
-        app_type="",
-        port=port,
-        telegram_chat_id=chat_id,
-        status=ProjectStatus.PENDING,
-        repo_url=repo_url,
-        complexity="imported",
+        name=name, slug=slug, brief=f"Imported from {repo_url}",
+        stack="", db_kind="none", app_type="", port=port,
+        telegram_chat_id=chat_id, status=ProjectStatus.PENDING,
+        repo_url=repo_url, complexity="imported",
     )
     project = await db.save(project)
-    asyncio.create_task(_run_import(bot, project, repo_url))
-    return project
 
-
-async def _run_import(bot: Bot, project: Project, repo_url: str):
-    """Clone → detect stack/DB → ensure a Dockerfile → first-deploy + verify."""
     tracker = ProgressTracker(bot, project)
-    tracker.init_steps([])  # no agents — clone + deploy only
+    gm = GitManager(project, tracker)
+    try:
+        info = await gm.import_repo(repo_url)
+    except Exception as e:
+        logger.exception(f"Import clone failed for {project.slug}")
+        await _discard_import(project)
+        return {"outcome": "error", "message": f"Clone failed: {e}"}
+
+    if info.get("full_name"):
+        project.repo_full_name = info["full_name"]
+        project.default_branch = info.get("default_branch") or "main"
+        project.repo_url = info.get("html_url") or repo_url
+
+    project_dir = project.project_dir
+
+    # 1) docker-compose → deploy the whole stack as defined.
+    compose_rel = compose_mod.find_compose_file(project_dir)
+    if compose_rel:
+        services = compose_mod.parse_services(project_dir / compose_rel)
+        candidates = compose_mod.web_service_candidates(services)
+        project.deploy_mode = "compose"
+        project.compose_file = compose_rel
+        if len(candidates) == 1:
+            project.web_service, project.web_container_port = candidates[0]
+            await db.save(project)
+            return {"outcome": "ready", "project_id": project.id, "mode": "compose",
+                    "summary": (f"compose ({compose_rel}) → "
+                                f"<code>{candidates[0][0]}</code>:{candidates[0][1]}")}
+        if len(candidates) == 0:
+            svc_list = ", ".join(services.keys()) or "none"
+            await _discard_import(project)
+            return {"outcome": "error", "message": (
+                f"Found <code>{compose_rel}</code>, but no service publishes a web port, "
+                f"so there's nothing to route a subdomain to.\n\n"
+                f"Add a <code>ports:</code> mapping to your public/web service (e.g. the "
+                f"frontend or a gateway), then re-import.\nServices seen: {svc_list}.")}
+        await db.save(project)
+        return {"outcome": "choose_web", "project_id": project.id,
+                "compose_file": compose_rel, "services": candidates}
+
+    # 2) Single root Dockerfile → single-container deploy, used as-is.
+    if (project_dir / "Dockerfile").exists():
+        project.deploy_mode = "dockerfile"
+        project.stack = stacks.detect_stack(project_dir)
+        project.app_type = project.stack
+        await db.save(project)
+        return {"outcome": "ready", "project_id": project.id, "mode": "dockerfile",
+                "summary": "single container (root <code>Dockerfile</code>)"}
+
+    # 3) Nothing we can deploy — be explicit, don't guess.
+    await _discard_import(project)
+    return {"outcome": "error", "message": (
+        "No <code>Dockerfile</code> or <code>docker-compose.yml</code> found, so I can't "
+        "tell how to build this repo.\n\nAdd one that runs your app on a port — a root "
+        "<code>Dockerfile</code>, or a <code>docker-compose.yml</code> (root or under "
+        "<code>infra/</code>, <code>deploy/</code>, <code>docker/</code>) whose web service "
+        "publishes a port — then re-import.")}
+
+
+async def finish_import(bot: Bot, project_id: int,
+                        web_service: str = "", web_container_port: int = 0):
+    """Kick off the actual deploy for an import prepared by begin_import()."""
+    project = await db.get(project_id)
+    if not project:
+        return
+    if web_service:
+        project.web_service = web_service
+        if web_container_port:
+            project.web_container_port = web_container_port
+        await db.save(project)
+    asyncio.create_task(_deploy_imported(bot, project))
+
+
+async def _deploy_imported(bot: Bot, project: Project):
+    """Deploy a prepared import (compose stack or single Dockerfile) + report."""
+    tracker = ProgressTracker(bot, project)
+    tracker.init_steps([])  # no agents
     step_est = tracker.get_step("estimate")
     if step_est:
         step_est.done("Import")
@@ -568,37 +631,16 @@ async def _run_import(bot: Bot, project: Project, repo_url: str):
         step_appr.done("From Git")
     await tracker.send_initial()
 
-    # ── Clone the existing repo ──
-    gm = GitManager(project, tracker)
-    try:
-        info = await gm.import_repo(repo_url)
-    except Exception as e:
-        logger.exception(f"Import clone failed for {project.slug}")
-        await tracker.fail(f"Clone failed: {e}")
-        return
+    if project.deploy_mode == "compose":
+        tracker.log(
+            f"Deploying compose stack ({project.compose_file}) — routing service "
+            f"'{project.web_service}' (container port {project.web_container_port})."
+        )
+    else:
+        tracker.log("Deploying single container from the repo's own Dockerfile.")
 
-    # ── Detect the stack + database, wire Git tracking ──
-    project_dir = project.project_dir
-    stack = stacks.detect_stack(project_dir)
-    db_kind = _detect_db_kind(project_dir)
-    project.stack = stack
-    project.app_type = stack
-    project.db_kind = db_kind
-    if info.get("full_name"):
-        project.repo_full_name = info["full_name"]
-        project.default_branch = info.get("default_branch") or "main"
-        project.repo_url = info.get("html_url") or repo_url
     project.status = ProjectStatus.BUILDING
     await db.save(project)
-
-    has_dockerfile = (project_dir / "Dockerfile").exists()
-    stack_label = stacks.stack_display(stack) if stacks.is_known_stack(stack) else stack
-    tracker.log(
-        f"Imported repo — stack: {stack_label} | db: {db_kind} | "
-        f"Dockerfile: {'present (will be used as-is)' if has_dockerfile else 'absent (generating one)'}"
-    )
-
-    # ── Build, run, health-check, route, verify (first-deploy path) ──
     try:
         deployed = await deploy_project(bot, project, tracker)
     except Exception as e:
@@ -606,44 +648,72 @@ async def _run_import(bot: Bot, project: Project, repo_url: str):
         await tracker.fail(f"Deploy error: {e}")
         return
 
-    if deployed:
-        logger.info(f"Imported project {project.slug} is live at {project.url}")
+    if not deployed:
+        return
 
-        # If we had to ADD the deployment mechanism and it's a GitHub repo under
-        # our token, push it back so the repo is self-sufficient and survives the
-        # hard-reset that /redeploy does (otherwise the generated Dockerfile,
-        # being unpushed, would be discarded on the next redeploy).
-        pushed_deploy_files = False
-        if not has_dockerfile and project.repo_full_name:
-            if await gm.commit_and_push("Add AppFactory deployment (Dockerfile + .dockerignore)"):
-                pushed_deploy_files = True
-                tracker.log("⬆️ Pushed generated Dockerfile to GitHub.")
-
+    logger.info(f"Imported project {project.slug} is live at {project.url}")
+    if project.deploy_mode == "compose":
+        mode_line = f"🧩 Mode: docker-compose ({project.compose_file}) → {project.web_service}"
+    else:
+        mode_line = "🐳 Mode: single container (your Dockerfile)"
+    next_steps = (
+        "Maintain it: <code>/redeploy</code> (git pull + rebuild), "
+        "<code>/logs</code>, <code>/stop</code>, <code>/delete</code>."
+    )
+    if not project.repo_full_name:
         next_steps = (
-            "Maintain it like any project: "
-            "<code>/redeploy</code>, <code>/update</code>, <code>/logs</code>, "
-            "<code>/stop</code>, <code>/delete</code>."
+            "⚠️ Not a GitHub repo under your token, so <code>/redeploy</code> isn't wired — "
+            "use <code>/logs</code>, <code>/stop</code>, <code>/delete</code>."
         )
-        if not project.repo_full_name:
-            next_steps = (
-                "⚠️ Not a GitHub repo under your token, so <code>/redeploy</code> isn't wired. "
-                "You can still <code>/rebuild</code>, <code>/logs</code>, <code>/stop</code>, "
-                "<code>/delete</code>."
-            )
+    await bot.send_message(
+        chat_id=project.telegram_chat_id,
+        text=(f"📥 <b>Imported & deployed #{project.id} {project.name}</b>\n"
+              f"{mode_line}\n\n{next_steps}"),
+        parse_mode="HTML",
+    )
 
-        dockerfile_note = "existing" if has_dockerfile else (
-            "generated & pushed" if pushed_deploy_files else "generated"
+
+async def deploy_compose(project: Project, tracker: ProgressTracker) -> bool:
+    """Bring up an imported repo's docker-compose stack and route the web service."""
+    cm = ComposeManager(project, tracker)
+
+    await tracker.step_start("docker_build", "Building & starting compose stack...")
+    ok, out = await cm.up()
+    if not ok:
+        await tracker.step_fail("docker_build", "compose up failed")
+        await tracker.fail(f"<code>docker compose up</code> failed:\n<pre>{out[-900:]}</pre>")
+        return False
+    await tracker.step_done("docker_build", "Stack built & started")
+
+    await tracker.step_start("docker_start", f"Resolving '{project.web_service}' host port...")
+    port = await cm.discover_published_port()
+    if not port:
+        logs = await cm.logs(tail=40, service=project.web_service)
+        await tracker.step_fail("docker_start", "Web service publishes no host port")
+        await tracker.fail(
+            f"Service '{project.web_service}' isn't publishing container port "
+            f"{project.web_container_port} to the host, so it can't be routed.\n"
+            f"Add a <code>ports:</code> mapping for it in {project.compose_file}.\n\n"
+            f"<pre>{logs[-500:]}</pre>"
         )
-        await bot.send_message(
-            chat_id=project.telegram_chat_id,
-            text=(
-                f"📥 <b>Imported & deployed #{project.id} {project.name}</b>\n"
-                f"🧱 Stack: {stack_label} | 🗄️ DB: {db_kind} | "
-                f"🐳 Dockerfile: {dockerfile_note}\n\n"
-                f"{next_steps}"
-            ),
-            parse_mode="HTML",
+        return False
+    project.port = port
+    await db.save(project)
+    await tracker.step_done("docker_start", f"{project.web_service} → host port {port}")
+
+    if not await cm.await_health(port):
+        logs = await cm.logs(tail=40, service=project.web_service)
+        await tracker.fail(
+            f"The web service didn't become healthy on port {port}.\n\n<pre>{logs[-600:]}</pre>"
         )
+        return False
+
+    tunnel_mgr = TunnelManager(project, tracker)
+    url = await tunnel_mgr.setup_route()
+    if not url:
+        return False
+    await _verify_and_complete(project, tracker, url)
+    return True
 
 
 async def update_project(
