@@ -29,7 +29,12 @@ from bot.handlers.commands import (
     cmd_repo,
     cmd_redeploy,
 )
-from bot.handlers.conversations import get_conversation_handler, get_voice_conversation_handler, get_update_conversation_handler
+from bot.handlers.conversations import (
+    get_conversation_handler,
+    get_voice_conversation_handler,
+    get_update_conversation_handler,
+    get_import_conversation_handler,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +77,8 @@ def main():
     app.add_handler(get_voice_conversation_handler())
     # Update flow — /update <id> or /update then pick
     app.add_handler(get_update_conversation_handler())
+    # Import flow — /import an existing repo and deploy it by subdomain
+    app.add_handler(get_import_conversation_handler())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))

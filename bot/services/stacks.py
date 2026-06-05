@@ -12,6 +12,8 @@ without import cycles.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 STACK_PYTHON = "python"
 STACK_SPRING = "spring"
 STACK_ANGULAR = "angular"
@@ -115,6 +117,39 @@ def keyboard_rows() -> list[list[str]]:
     """Two-per-row keyboard layout of stack labels for python-telegram-bot."""
     labels = [meta["keyboard_label"] for meta in STACKS.values()]
     return [labels[i:i + 2] for i in range(0, len(labels), 2)]
+
+
+def detect_stack(project_dir: Path) -> str:
+    """Best-effort detect the stack of an EXISTING (imported) repo from its files.
+
+    Returns one of the four known stack keys when the layout matches, or the
+    legacy markers 'node'/'static' which the Docker manager knows how to
+    containerize via its file-based fallback. Used by `/import` so an
+    already-built repo can be deployed without the user picking a stack.
+    """
+    def has(*names: str) -> bool:
+        return any((project_dir / n).exists() for n in names)
+
+    frontend = project_dir / "frontend"
+    if has("pom.xml"):
+        # A Spring backend with an Angular frontend folder → fullstack.
+        if frontend.is_dir() and (
+            (frontend / "angular.json").exists() or (frontend / "package.json").exists()
+        ):
+            return STACK_SPRING_ANGULAR
+        return STACK_SPRING
+    if has("angular.json"):
+        return STACK_ANGULAR
+    if has("requirements.txt", "app.py", "pyproject.toml", "Pipfile"):
+        return STACK_PYTHON
+    if has("package.json"):
+        return "node"
+    return "static"
+
+
+def is_known_stack(stack: str) -> bool:
+    """True when `stack` is one of the four locked stacks (not a legacy marker)."""
+    return stack in STACKS
 
 
 # ──────────────────────────────────────────────

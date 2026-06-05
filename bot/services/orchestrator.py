@@ -493,6 +493,159 @@ async def _run_redeploy(bot: Bot, project: Project, tracker: ProgressTracker):
         await tracker.fail(f"Redeploy error: {e}")
 
 
+def _detect_db_kind(project_dir: Path) -> str:
+    """Infer a project's database from its committed files (for /import).
+
+    Scans the common manifest/config files for a postgres or sqlite reference
+    so we only provision (and inject env for) a database the app actually uses.
+    Returns 'postgres' | 'sqlite' | 'none'."""
+    candidates = [
+        "pom.xml", "build.gradle", "requirements.txt", "pyproject.toml",
+        "package.json", "app.py", "docker-compose.yml", "compose.yaml",
+        "src/main/resources/application.properties",
+        "src/main/resources/application.yml",
+        "src/main/resources/application.yaml",
+    ]
+    blob = ""
+    for rel in candidates:
+        p = project_dir / rel
+        if p.exists() and p.is_file():
+            try:
+                blob += p.read_text(encoding="utf-8", errors="replace").lower()
+            except Exception:
+                pass
+    if "postgres" in blob or "postgresql" in blob:
+        return "postgres"
+    if "sqlite" in blob:
+        return "sqlite"
+    return "none"
+
+
+async def import_project(
+    bot: Bot,
+    chat_id: int,
+    name: str,
+    repo_url: str,
+) -> Project:
+    """Adopt an existing Git repo and deploy it under a subdomain.
+
+    The only inputs are the repo URL and the subdomain name — the stack, DB and
+    Dockerfile are auto-detected/generated. Wires up Git tracking so the project
+    can afterwards be maintained with /redeploy and /update like any other.
+    """
+    slug = slugify(name)
+    if await db.get_by_slug(slug):
+        slug = f"{slug}-{int(asyncio.get_event_loop().time()) % 10000}"
+
+    port = await db.next_available_port()
+    project = Project(
+        name=name,
+        slug=slug,
+        brief=f"Imported from {repo_url}",
+        stack="",
+        db_kind="none",
+        app_type="",
+        port=port,
+        telegram_chat_id=chat_id,
+        status=ProjectStatus.PENDING,
+        repo_url=repo_url,
+        complexity="imported",
+    )
+    project = await db.save(project)
+    asyncio.create_task(_run_import(bot, project, repo_url))
+    return project
+
+
+async def _run_import(bot: Bot, project: Project, repo_url: str):
+    """Clone → detect stack/DB → ensure a Dockerfile → first-deploy + verify."""
+    tracker = ProgressTracker(bot, project)
+    tracker.init_steps([])  # no agents — clone + deploy only
+    step_est = tracker.get_step("estimate")
+    if step_est:
+        step_est.done("Import")
+    step_appr = tracker.get_step("approval")
+    if step_appr:
+        step_appr.done("From Git")
+    await tracker.send_initial()
+
+    # ── Clone the existing repo ──
+    gm = GitManager(project, tracker)
+    try:
+        info = await gm.import_repo(repo_url)
+    except Exception as e:
+        logger.exception(f"Import clone failed for {project.slug}")
+        await tracker.fail(f"Clone failed: {e}")
+        return
+
+    # ── Detect the stack + database, wire Git tracking ──
+    project_dir = project.project_dir
+    stack = stacks.detect_stack(project_dir)
+    db_kind = _detect_db_kind(project_dir)
+    project.stack = stack
+    project.app_type = stack
+    project.db_kind = db_kind
+    if info.get("full_name"):
+        project.repo_full_name = info["full_name"]
+        project.default_branch = info.get("default_branch") or "main"
+        project.repo_url = info.get("html_url") or repo_url
+    project.status = ProjectStatus.BUILDING
+    await db.save(project)
+
+    has_dockerfile = (project_dir / "Dockerfile").exists()
+    stack_label = stacks.stack_display(stack) if stacks.is_known_stack(stack) else stack
+    tracker.log(
+        f"Imported repo — stack: {stack_label} | db: {db_kind} | "
+        f"Dockerfile: {'present (will be used as-is)' if has_dockerfile else 'absent (generating one)'}"
+    )
+
+    # ── Build, run, health-check, route, verify (first-deploy path) ──
+    try:
+        deployed = await deploy_project(bot, project, tracker)
+    except Exception as e:
+        logger.exception(f"Import deploy failed for {project.slug}")
+        await tracker.fail(f"Deploy error: {e}")
+        return
+
+    if deployed:
+        logger.info(f"Imported project {project.slug} is live at {project.url}")
+
+        # If we had to ADD the deployment mechanism and it's a GitHub repo under
+        # our token, push it back so the repo is self-sufficient and survives the
+        # hard-reset that /redeploy does (otherwise the generated Dockerfile,
+        # being unpushed, would be discarded on the next redeploy).
+        pushed_deploy_files = False
+        if not has_dockerfile and project.repo_full_name:
+            if await gm.commit_and_push("Add AppFactory deployment (Dockerfile + .dockerignore)"):
+                pushed_deploy_files = True
+                tracker.log("⬆️ Pushed generated Dockerfile to GitHub.")
+
+        next_steps = (
+            "Maintain it like any project: "
+            "<code>/redeploy</code>, <code>/update</code>, <code>/logs</code>, "
+            "<code>/stop</code>, <code>/delete</code>."
+        )
+        if not project.repo_full_name:
+            next_steps = (
+                "⚠️ Not a GitHub repo under your token, so <code>/redeploy</code> isn't wired. "
+                "You can still <code>/rebuild</code>, <code>/logs</code>, <code>/stop</code>, "
+                "<code>/delete</code>."
+            )
+
+        dockerfile_note = "existing" if has_dockerfile else (
+            "generated & pushed" if pushed_deploy_files else "generated"
+        )
+        await bot.send_message(
+            chat_id=project.telegram_chat_id,
+            text=(
+                f"📥 <b>Imported & deployed #{project.id} {project.name}</b>\n"
+                f"🧱 Stack: {stack_label} | 🗄️ DB: {db_kind} | "
+                f"🐳 Dockerfile: {dockerfile_note}\n\n"
+                f"{next_steps}"
+            ),
+            parse_mode="HTML",
+        )
+
+
 async def update_project(
     bot: Bot,
     chat_id: int,

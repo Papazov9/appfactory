@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import httpx
 
@@ -95,6 +96,40 @@ class GitManager:
     def _token_remote(self, full_name: str) -> str:
         return f"https://x-access-token:{config.GITHUB_TOKEN}@github.com/{full_name}.git"
 
+    @staticmethod
+    def _parse_github(url: str) -> tuple[str | None, str]:
+        """From an arbitrary git URL, extract (owner/name, clean https URL).
+
+        Returns (None, url) for non-GitHub URLs so they can still be cloned
+        (e.g. a public repo) but won't be wired for token push/pull."""
+        u = url.strip()
+        m = re.search(r"github\.com[/:]+([^/]+/[^/]+?)(?:\.git)?/?$", u)
+        if m:
+            full = m.group(1)
+            return full, f"https://github.com/{full}"
+        return None, u
+
+    def _scrub(self, text: str) -> str:
+        """Redact the GitHub token from any text we might surface to the user."""
+        if config.GITHUB_TOKEN:
+            return text.replace(config.GITHUB_TOKEN, "***")
+        return text
+
+    async def _clone(self, url: str, target: str) -> tuple[int, str]:
+        """Run `git clone` outside the project dir (which doesn't exist yet)."""
+        cmd = [
+            "git",
+            "-c", f"user.name={config.GIT_AUTHOR_NAME}",
+            "-c", f"user.email={config.GIT_AUTHOR_EMAIL}",
+            "clone", url, target,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out = (stdout + stderr).decode("utf-8", errors="replace")
+        return proc.returncode, out
+
     async def _has_git(self) -> bool:
         rc, _ = await self._git("rev-parse", "--is-inside-work-tree", check=False)
         return rc == 0
@@ -134,6 +169,33 @@ class GitManager:
             return resp.json()
 
     # ── Public operations ────────────────────
+    async def import_repo(self, repo_url: str) -> dict:
+        """Clone an EXISTING repo into the project dir and wire up Git tracking.
+
+        Used by `/import` to adopt a repo the user built themselves. Returns
+        {"full_name", "default_branch", "html_url"}; full_name is None for
+        non-GitHub URLs (still cloned, but not set up for token push/pull)."""
+        target = self.project.project_dir
+        if target.exists() and any(target.iterdir()):
+            raise GitError(f"Target directory {target} already exists and is not empty.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        full_name, html_url = self._parse_github(repo_url)
+        # Use the token for GitHub so private repos clone and future push/pull work.
+        clone_url = (
+            self._token_remote(full_name)
+            if full_name and config.GITHUB_TOKEN else repo_url
+        )
+
+        self._log(f"Cloning {html_url} ...")
+        rc, out = await self._clone(clone_url, str(target))
+        if rc != 0:
+            raise GitError(f"git clone failed: {self._scrub(out)[-400:]}")
+
+        _, branch = await self._git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+        branch = branch.strip() or "main"
+        return {"full_name": full_name, "default_branch": branch, "html_url": html_url}
+
     async def create_repo(self) -> str:
         """Init git, commit the source, create the GitHub repo, push. Returns the html URL."""
         if not config.github_enabled:

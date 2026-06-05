@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 from bot.config import config
-from bot.services.orchestrator import create_project, update_project
+from bot.services.orchestrator import create_project, update_project, import_project
 from bot.services.transcriber import Transcriber
 from bot.services import stacks
 from bot.models.project import db
@@ -28,6 +28,9 @@ VOICE_WAIT, VOICE_CONFIRM, VOICE_EDIT = 10, 11, 12
 
 # Update flow states
 UPDATE_SELECT, UPDATE_INSTRUCTIONS = 20, 21
+
+# Import flow states (adopt an existing repo for deployment)
+IMPORT_URL, IMPORT_NAME = 30, 31
 
 STACK_KEYBOARD = ReplyKeyboardMarkup(
     stacks.keyboard_rows(),
@@ -496,6 +499,89 @@ async def update_instructions_photo(update: Update, context: ContextTypes.DEFAUL
 
 
 # ──────────────────────────────────────────────
+#  /import flow: adopt an existing repo and deploy it
+# ──────────────────────────────────────────────
+
+def _looks_like_git_url(url: str) -> bool:
+    return url.startswith(("http://", "https://", "git@", "ssh://"))
+
+
+async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /import — adopt an already-built repo and deploy it by subdomain."""
+    # Allow `/import <url>` to skip straight to the name step.
+    if context.args and _looks_like_git_url(context.args[0].strip()):
+        context.user_data["import_url"] = context.args[0].strip()
+        await update.message.reply_text(
+            "📥 <b>Import repo</b>\n\n"
+            "What subdomain name should it get?\n"
+            "<i>(e.g. 'acme-api' → acme-api.yourdomain.com)</i>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return IMPORT_NAME
+
+    await update.message.reply_text(
+        "📥 <b>Import an existing repo</b>\n\n"
+        "Send the <b>HTTPS Git URL</b> of a repo you've already built and committed.\n"
+        "<i>(e.g. https://github.com/you/my-app)</i>\n\n"
+        "I'll clone it, detect the stack, add a Dockerfile if one's missing, "
+        "and deploy it — you only need to pick a subdomain next.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return IMPORT_URL
+
+
+async def import_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    if url in CANCEL_WORDS:
+        return await cancel(update, context)
+    if not _looks_like_git_url(url):
+        await update.message.reply_text(
+            "That doesn't look like a Git URL. Send something like "
+            "<code>https://github.com/you/my-app</code> (or /cancel).",
+            parse_mode="HTML",
+        )
+        return IMPORT_URL
+
+    context.user_data["import_url"] = url
+    await update.message.reply_text(
+        "What subdomain name should it get?\n"
+        "<i>(e.g. 'acme-api' → acme-api.yourdomain.com)</i>",
+        parse_mode="HTML",
+    )
+    return IMPORT_NAME
+
+
+async def import_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if name in CANCEL_WORDS:
+        return await cancel(update, context)
+
+    from bot.services.orchestrator import slugify
+    if not slugify(name):
+        await update.message.reply_text(
+            "That name has no usable characters for a subdomain. Try another (or /cancel)."
+        )
+        return IMPORT_NAME
+
+    url = context.user_data.get("import_url", "")
+    await update.message.reply_text(
+        f"📥 Importing <b>{name}</b> from\n<code>{url}</code>\n\nProgress updates below.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await import_project(
+        bot=context.bot,
+        chat_id=update.effective_chat.id,
+        name=name,
+        repo_url=url,
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
 #  Shared helpers
 # ──────────────────────────────────────────────
 
@@ -584,6 +670,23 @@ def get_update_conversation_handler() -> ConversationHandler:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="update_flow",
+    )
+
+
+def get_import_conversation_handler() -> ConversationHandler:
+    """/import flow: repo URL → subdomain name → clone & deploy (no AI)."""
+    return ConversationHandler(
+        entry_points=[CommandHandler("import", import_start)],
+        states={
+            IMPORT_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_receive_url),
+            ],
+            IMPORT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_receive_name),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="import_flow",
     )
 
 
