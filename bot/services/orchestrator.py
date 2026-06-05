@@ -561,11 +561,13 @@ async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict
 
     project_dir = project.project_dir
 
-    # 1) docker-compose → deploy the whole stack as defined.
+    # 1) A docker-compose with a routable web service → deploy the stack as-is.
     compose_rel = compose_mod.find_compose_file(project_dir)
+    candidates: list = []
     if compose_rel:
         services = compose_mod.parse_services(project_dir / compose_rel)
         candidates = compose_mod.web_service_candidates(services)
+    if compose_rel and candidates:
         project.deploy_mode = "compose"
         project.compose_file = compose_rel
         if len(candidates) == 1:
@@ -574,19 +576,11 @@ async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict
             return {"outcome": "ready", "project_id": project.id, "mode": "compose",
                     "summary": (f"compose ({compose_rel}) → "
                                 f"<code>{candidates[0][0]}</code>:{candidates[0][1]}")}
-        if len(candidates) == 0:
-            svc_list = ", ".join(services.keys()) or "none"
-            await _discard_import(project)
-            return {"outcome": "error", "message": (
-                f"Found <code>{compose_rel}</code>, but no service publishes a web port, "
-                f"so there's nothing to route a subdomain to.\n\n"
-                f"Add a <code>ports:</code> mapping to your public/web service (e.g. the "
-                f"frontend or a gateway), then re-import.\nServices seen: {svc_list}.")}
         await db.save(project)
         return {"outcome": "choose_web", "project_id": project.id,
                 "compose_file": compose_rel, "services": candidates}
 
-    # 2) Single root Dockerfile → single-container deploy, used as-is.
+    # 2) A single root Dockerfile → single-container deploy, used as-is.
     if (project_dir / "Dockerfile").exists():
         project.deploy_mode = "dockerfile"
         project.stack = stacks.detect_stack(project_dir)
@@ -595,14 +589,14 @@ async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict
         return {"outcome": "ready", "project_id": project.id, "mode": "dockerfile",
                 "summary": "single container (root <code>Dockerfile</code>)"}
 
-    # 3) Nothing we can deploy — be explicit, don't guess.
-    await _discard_import(project)
-    return {"outcome": "error", "message": (
-        "No <code>Dockerfile</code> or <code>docker-compose.yml</code> found, so I can't "
-        "tell how to build this repo.\n\nAdd one that runs your app on a port — a root "
-        "<code>Dockerfile</code>, or a <code>docker-compose.yml</code> (root or under "
-        "<code>infra/</code>, <code>deploy/</code>, <code>docker/</code>) whose web service "
-        "publishes a port — then re-import.")}
+    # 3) No usable deployment definition → have Claude generate a docker-compose.
+    if compose_rel:
+        reason = (f"a <code>{compose_rel}</code> exists but only defines infra/DB "
+                  f"(no service publishes a web port)")
+    else:
+        reason = "no <code>Dockerfile</code> or <code>docker-compose</code> is present"
+    await db.save(project)
+    return {"outcome": "generate", "project_id": project.id, "reason": reason}
 
 
 async def finish_import(bot: Bot, project_id: int,
@@ -714,6 +708,180 @@ async def deploy_compose(project: Project, tracker: ProgressTracker) -> bool:
         return False
     await _verify_and_complete(project, tracker, url)
     return True
+
+
+# ──────────────────────────────────────────────
+#  AI fallback — generate a docker-compose when the repo defines none
+# ──────────────────────────────────────────────
+
+_COMPOSE_GEN_PROMPT = """You are a senior DevOps engineer. The repository in the CURRENT WORKING DIRECTORY has NO usable deployment definition, and {reason}. Make it deployable as ONE docker-compose stack.
+
+Steps:
+1. Explore the repo (read package.json / requirements.txt / pom.xml / angular.json / *.env.example / any existing dev docker-compose, and the source layout). Work out every part (backend, frontend, extra services), how each builds and runs in PRODUCTION, and what database/cache it needs.
+2. Write a production `docker-compose.yml` AT THE REPOSITORY ROOT that builds and runs EVERY service from source, wired on a private network.
+3. Write any per-service Dockerfile(s) needed (e.g. backend/Dockerfile, frontend/Dockerfile) — multi-stage, production builds.
+
+HARD REQUIREMENTS (the deploy system depends on these — do not break them):
+- Exactly ONE public web service is the entry point (the frontend, or a reverse proxy / gateway that serves the frontend and proxies the API). It MUST publish its HTTP port to the host with a fixed mapping like `ports: ["8080:8080"]` (pick any sensible fixed port; the server routes a public subdomain to whatever host port it publishes). Bind 0.0.0.0 inside the container.
+- Every OTHER service (backend, db, cache) talks over the compose network and should NOT publish host ports.
+- Reuse the repo's existing intent: if there's a dev docker-compose or env example, match the SAME database image (e.g. pgvector/pgvector if used), versions, credentials, database name, and the exact env var names the app reads. Include the database as a service with a persistent named volume, and pass the app the connection settings it expects.
+- The frontend MUST reach the backend at runtime — prefer same-origin through the web/proxy service; otherwise build the frontend with the backend's in-network URL.
+- PRODUCTION builds only. Never run dev servers (`npm start`, `ng serve`, `uvicorn --reload`) — use real builds and production start commands. Run DB migrations/seeds on startup if the app supports it.
+- Make it actually run with `docker compose up --build` from the repo root. Do NOT start any containers yourself — only write files.
+
+Existing files (excerpt):
+{file_map}
+
+Write all files now, conventional and commit-quality."""
+
+
+async def _repo_file_map(project_dir) -> str:
+    """A compact file listing to orient the generator (it can still read freely)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "find", ".", "-type", "f",
+            "-not", "-path", "*/.git/*", "-not", "-path", "*/node_modules/*",
+            "-not", "-path", "*/target/*", "-not", "-path", "*/dist/*",
+            "-not", "-path", "*/.angular/*",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=str(project_dir),
+        )
+        out, _ = await proc.communicate()
+        files = sorted(l for l in out.decode("utf-8", errors="replace").splitlines() if l.strip())
+        return "\n".join(files[:200])
+    except Exception:
+        return ""
+
+
+async def _run_claude(project: Project, prompt: str,
+                      max_turns: int = 40, timeout: int = 1800) -> tuple[bool, str]:
+    """Run the claude CLI in the project dir (same mechanism as the build agents)."""
+    import os
+    env_vars = dict(os.environ)
+    if config.ANTHROPIC_API_KEY:
+        env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
+    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions",
+           "--max-turns", str(max_turns), "--output-format", "stream-json", "--verbose"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=str(project.project_dir), env=env_vars,
+        )
+        so, se = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return False, f"AI generation timed out after {timeout // 60} minutes."
+    except FileNotFoundError:
+        return False, "The `claude` CLI was not found on this host."
+    if proc.returncode != 0:
+        err = se.decode("utf-8", errors="replace").strip()
+        return False, err[-600:] or f"claude exited with code {proc.returncode}"
+    return True, so.decode("utf-8", errors="replace")
+
+
+def _pick_web_service(candidates: list[tuple[str, int]]) -> tuple[str, int]:
+    """Choose the public web service from AI-generated candidates (it's told to make one)."""
+    preferred = ("web", "frontend", "gateway", "proxy", "nginx", "caddy", "app", "client", "ui", "www")
+    for name, port in candidates:
+        if any(k in name.lower() for k in preferred):
+            return name, port
+    return candidates[0]
+
+
+async def generate_and_deploy_import(bot: Bot, project_id: int):
+    """Have Claude generate a docker-compose for a prepared import, then deploy it."""
+    project = await db.get(project_id)
+    if not project:
+        return
+    asyncio.create_task(_ai_compose_and_deploy(bot, project))
+
+
+async def _ai_compose_and_deploy(bot: Bot, project: Project):
+    tracker = ProgressTracker(bot, project)
+    tracker.init_steps(["composer"])  # single "🤖 Composer" step + deploy steps
+    step_est = tracker.get_step("estimate")
+    if step_est:
+        step_est.done("Import")
+    step_appr = tracker.get_step("approval")
+    if step_appr:
+        step_appr.done("AI deploy")
+    await tracker.send_initial()
+
+    project.status = ProjectStatus.BUILDING
+    await db.save(project)
+
+    # ── Generate the deployment config with Claude ──
+    file_map = await _repo_file_map(project.project_dir)
+    existing = compose_mod.find_compose_file(project.project_dir)
+    reason = (
+        f"a <code>{existing}</code> exists but only defines infra/DB (no web service "
+        f"publishes a port) — reuse its database definition"
+        if existing else "no Dockerfile or docker-compose is present"
+    ).replace("<code>", "`").replace("</code>", "`")
+    prompt = _COMPOSE_GEN_PROMPT.format(reason=reason, file_map=file_map or "(none listed)")
+
+    await tracker.step_start("agent:composer", "Claude is analyzing the repo & writing docker-compose...")
+    tracker.log("🤖 Generating a docker-compose with Claude (this uses tokens)...")
+    ok, out = await _run_claude(project, prompt, max_turns=40, timeout=1800)
+    if not ok:
+        await tracker.step_fail("agent:composer", "AI generation failed")
+        await tracker.fail(f"Couldn't generate a deployment config:\n<pre>{out[-600:]}</pre>")
+        return
+    await tracker.step_done("agent:composer", "docker-compose generated")
+
+    # ── Detect what it produced ──
+    compose_rel = compose_mod.find_compose_file(project.project_dir)
+    if not compose_rel:
+        await tracker.fail(
+            "Claude finished but didn't produce a docker-compose.yml. "
+            "Use /rebuild to retry, or add one manually and /redeploy."
+        )
+        return
+    services = compose_mod.parse_services(project.project_dir / compose_rel)
+    candidates = compose_mod.web_service_candidates(services)
+    if not candidates:
+        await tracker.fail(
+            f"The generated <code>{compose_rel}</code> has no service publishing a web port, "
+            f"so it can't be routed. /rebuild to retry."
+        )
+        return
+    web, port = _pick_web_service(candidates)
+    project.deploy_mode = "compose"
+    project.compose_file = compose_rel
+    project.web_service = web
+    project.web_container_port = port
+    await db.save(project)
+    tracker.log(f"Generated {compose_rel}: services {list(services)} → routing '{web}':{port}")
+
+    # ── Deploy the generated stack ──
+    deployed = await deploy_compose(project, tracker)
+    if not deployed:
+        return
+
+    # ── Push the generated config back (user opted in) ──
+    pushed = False
+    if project.repo_full_name:
+        gm = GitManager(project, tracker)
+        if await gm.commit_and_push("Add AppFactory deployment (AI-generated docker-compose)"):
+            pushed = True
+            tracker.log("⬆️ Pushed the generated docker-compose to GitHub.")
+
+    push_line = ("✅ Pushed the generated <code>docker-compose.yml</code> to your repo."
+                 if pushed else
+                 "ℹ️ Generated locally (not a GitHub repo under your token, so not pushed).")
+    await bot.send_message(
+        chat_id=project.telegram_chat_id,
+        text=(f"📥 <b>Imported & deployed #{project.id} {project.name}</b>\n"
+              f"🤖 AI-generated docker-compose ({compose_rel}) → routing <code>{web}</code>\n"
+              f"{push_line}\n\n"
+              f"Maintain it: <code>/redeploy</code>, <code>/logs</code>, "
+              f"<code>/stop</code>, <code>/delete</code>."),
+        parse_mode="HTML",
+    )
 
 
 async def update_project(

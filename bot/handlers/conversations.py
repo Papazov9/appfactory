@@ -13,7 +13,9 @@ from telegram.ext import (
 )
 
 from bot.config import config
-from bot.services.orchestrator import create_project, update_project, begin_import, finish_import
+from bot.services.orchestrator import (
+    create_project, update_project, begin_import, finish_import, generate_and_deploy_import,
+)
 from bot.services.transcriber import Transcriber
 from bot.services import stacks
 from bot.models.project import db
@@ -524,9 +526,10 @@ async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "📥 <b>Import an existing repo</b>\n\n"
         "Send the <b>HTTPS Git URL</b> of a repo you've already built and committed.\n"
         "<i>(e.g. https://github.com/you/my-app)</i>\n\n"
-        "I deploy it <b>exactly as your repo defines it</b> — your "
+        "I deploy it <b>as your repo defines it</b> — your "
         "<code>docker-compose.yml</code> (multi-service) or root <code>Dockerfile</code> "
-        "(single container). No guessing, no generated files. You just pick a subdomain next.",
+        "(single container). If it has <b>neither</b>, Claude analyzes the repo and "
+        "generates a docker-compose for you. You just pick a subdomain next.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -586,6 +589,18 @@ async def import_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"❌ {result.get('message', 'Could not import this repo.')}",
             parse_mode="HTML",
         )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if outcome == "generate":
+        await update.message.reply_text(
+            f"🤖 No deployment config found ({result.get('reason', 'none present')}).\n\n"
+            f"I'll have <b>Claude</b> analyze the repo, generate a <code>docker-compose.yml</code>, "
+            f"deploy it, and push it to your repo.\n"
+            f"<i>This uses AI (tokens) and needs your Anthropic credit.</i>\n\nProgress below.",
+            parse_mode="HTML",
+        )
+        await generate_and_deploy_import(bot=context.bot, project_id=result["project_id"])
         context.user_data.clear()
         return ConversationHandler.END
 
