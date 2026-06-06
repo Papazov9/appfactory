@@ -335,12 +335,16 @@ class MultiAgentBuilder:
             if completed:
                 agents_to_run = [a for a in agents_to_run if a not in completed]
                 skipped_agents = completed
-                self.tracker.log(f"♻️ Resuming from checkpoint: skipping {', '.join(sorted(completed))}")
+                self.tracker.note(
+                    f"♻️ Resuming — already done: {', '.join(sorted(completed))} (skipping these)."
+                )
                 logger.info(f"Resuming {self.project.slug}: skipping {completed}")
             partial = [a for a in agents_to_run
                        if agent_progress.get(a, {}).get("files")]
             if partial:
-                self.tracker.log(f"↩️ Continuing partial work for: {', '.join(sorted(partial))}")
+                self.tracker.note(
+                    f"↩️ Continuing the partial work from: {', '.join(sorted(partial))}."
+                )
 
         # Cumulative set of agents finished across ALL runs of this build. Seed it
         # from the checkpoint's skipped agents so resumed runs don't forget prior
@@ -385,7 +389,11 @@ class MultiAgentBuilder:
                 # Retry — it receives the resume context (existing files + the
                 # error), so it continues rather than starting from scratch.
                 await self.tracker.step_start(step_key, "Retrying with error fix...")
-                self.tracker.log(f"⚠️ {agent_name} failed: {agent_tokens.error[:200]}")
+                self.tracker.note(
+                    f"⚠️ {agent_name.title()} hit an error — retrying with the fix applied "
+                    f"(keeping the work it already did)."
+                )
+                self.tracker.log(f"   {agent_name} error: {agent_tokens.error[:200]}")
 
                 retry_tokens = await self._run_agent(
                     agent_name, project_dir,
@@ -401,7 +409,10 @@ class MultiAgentBuilder:
                 if not retry_tokens.success:
                     if agent_name in optional_agents:
                         # Optional agent — warn but continue
-                        self.tracker.log(f"⚠️ Optional agent '{agent_name}' failed — continuing without it")
+                        self.tracker.note(
+                            f"⚠️ {agent_name.title()} couldn't finish, but it's optional — "
+                            f"continuing the build without it."
+                        )
                         await self.tracker.step_done(step_key, f"⚠️ Skipped (failed but non-blocking)")
                         save_checkpoint(project_dir, agent_name, "partial", self.report,
                                         completed_agents, agent_progress)
@@ -550,9 +561,9 @@ class MultiAgentBuilder:
         if config.ANTHROPIC_API_KEY:
             env_vars["ANTHROPIC_API_KEY"] = config.ANTHROPIC_API_KEY
 
-        self.tracker.log(
-            f"🤖 Agent '{agent_name}' starting "
-            f"(max {max_turns} turns, {timeout // 60}min budget [{complexity}])..."
+        self.tracker.note(
+            f"🤖 {agent_name.title()} agent started — up to {timeout // 60} min "
+            f"({complexity} project)."
         )
 
         try:
@@ -730,6 +741,12 @@ class MultiAgentBuilder:
             else:
                 tokens.success = True
 
+            if tokens.success:
+                self.tracker.note(
+                    f"✅ {agent_name.title()} done — {len(files_written)} file(s), "
+                    f"{tokens.duration_seconds:.0f}s, ${tokens.cost_usd:.3f}."
+                )
+            # Keep the full metrics in the build log for /logs and cost analysis.
             self.tracker.log(
                 f"🤖 Agent '{agent_name}' finished: "
                 f"{'✓' if tokens.success else '✗'} | "

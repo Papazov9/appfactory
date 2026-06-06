@@ -228,6 +228,7 @@ class DockerManager:
                 await self.tracker.step_fail("docker_build", "Image build failed")
                 await self.tracker.fail(f"Docker build failed:\n{out[-800:]}")
                 return False
+            self.tracker.note("🐳 Container image built successfully.")
             await self.tracker.step_done("docker_build", f"Image built: {self.image_tag}")
             return True
         except Exception as e:
@@ -329,7 +330,7 @@ class DockerManager:
                 await self._run_cmd(["docker", "start", self.db_container],
                                     label="start db", allow_fail=True)
             else:
-                self.tracker.log(f"Creating Postgres container {self.db_container}...")
+                self.tracker.note("🗄️ Provisioning a dedicated PostgreSQL container for this app...")
                 await self._run_cmd_capture([
                     "docker", "run", "-d",
                     "--name", self.db_container,
@@ -355,7 +356,7 @@ class DockerManager:
                 ["docker", "exec", self.db_container, "pg_isready", "-U", PG_USER]
             )
             if "accepting connections" in ready:
-                self.tracker.log("Postgres is ready.")
+                self.tracker.note("🗄️ Database is ready.")
                 return True
             await asyncio.sleep(1.5)
         self.tracker.log("⚠️ Postgres did not report ready after 30s.")
@@ -428,11 +429,13 @@ class DockerManager:
     def _write_dockerfile(self, project_dir: Path):
         dockerfile_path = project_dir / "Dockerfile"
         if dockerfile_path.exists():
-            self.tracker.log("Using existing Dockerfile")
+            self.tracker.note("📄 Using the repo's own Dockerfile.")
             return
         content = self._dockerfile_for(project_dir)
         dockerfile_path.write_text(content)
-        self.tracker.log(f"Generated Dockerfile for stack '{self.project.stack or self._detect_type(project_dir)}'")
+        self.tracker.note(
+            f"📄 Generated a Dockerfile for the {self.project.stack or self._detect_type(project_dir)} stack."
+        )
 
     def _dockerfile_for(self, project_dir: Path) -> str:
         port = self.project.port

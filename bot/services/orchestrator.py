@@ -241,6 +241,7 @@ async def _run_pipeline(bot: Bot, project: Project, estimate: CostEstimate,
         )
 
         # ── Phase 2–4: containerize, route, verify (zero-downtime aware) ──
+        tracker.note("🚀 Code is built — containerizing and deploying it now.")
         deployed = await deploy_project(bot, project, tracker)
         if deployed:
             logger.info(f"Project {project.slug} is live at {project.url}")
@@ -626,12 +627,12 @@ async def _deploy_imported(bot: Bot, project: Project):
     await tracker.send_initial()
 
     if project.deploy_mode == "compose":
-        tracker.log(
-            f"Deploying compose stack ({project.compose_file}) — routing service "
-            f"'{project.web_service}' (container port {project.web_container_port})."
+        tracker.note(
+            f"🧩 Found docker-compose ({project.compose_file}) — deploying the stack and "
+            f"routing your subdomain to '{project.web_service}'."
         )
     else:
-        tracker.log("Deploying single container from the repo's own Dockerfile.")
+        tracker.note("🐳 Found a Dockerfile — deploying it as a single container.")
 
     project.status = ProjectStatus.BUILDING
     await db.save(project)
@@ -671,12 +672,14 @@ async def deploy_compose(project: Project, tracker: ProgressTracker) -> bool:
     """Bring up an imported repo's docker-compose stack and route the web service."""
     cm = ComposeManager(project, tracker)
 
+    tracker.note("🐳 Building every service and starting the stack (docker compose up --build)...")
     await tracker.step_start("docker_build", "Building & starting compose stack...")
     ok, out = await cm.up()
     if not ok:
         await tracker.step_fail("docker_build", "compose up failed")
         await tracker.fail(f"<code>docker compose up</code> failed:\n<pre>{out[-900:]}</pre>")
         return False
+    tracker.note("✅ All services built and started.")
     await tracker.step_done("docker_build", "Stack built & started")
 
     await tracker.step_start("docker_start", f"Resolving '{project.web_service}' host port...")
@@ -693,6 +696,7 @@ async def deploy_compose(project: Project, tracker: ProgressTracker) -> bool:
         return False
     project.port = port
     await db.save(project)
+    tracker.note(f"🔌 '{project.web_service}' is published on host port {port} — routing the subdomain there.")
     await tracker.step_done("docker_start", f"{project.web_service} → host port {port}")
 
     if not await cm.await_health(port):
@@ -824,13 +828,14 @@ async def _ai_compose_and_deploy(bot: Bot, project: Project):
     ).replace("<code>", "`").replace("</code>", "`")
     prompt = _COMPOSE_GEN_PROMPT.format(reason=reason, file_map=file_map or "(none listed)")
 
+    tracker.note("🤖 No deploy config in the repo — Claude is reading the code to write one (uses tokens).")
     await tracker.step_start("agent:composer", "Claude is analyzing the repo & writing docker-compose...")
-    tracker.log("🤖 Generating a docker-compose with Claude (this uses tokens)...")
     ok, out = await _run_claude(project, prompt, max_turns=40, timeout=1800)
     if not ok:
         await tracker.step_fail("agent:composer", "AI generation failed")
         await tracker.fail(f"Couldn't generate a deployment config:\n<pre>{out[-600:]}</pre>")
         return
+    tracker.note("✅ Claude wrote a docker-compose for your app.")
     await tracker.step_done("agent:composer", "docker-compose generated")
 
     # ── Detect what it produced ──
@@ -855,7 +860,10 @@ async def _ai_compose_and_deploy(bot: Bot, project: Project):
     project.web_service = web
     project.web_container_port = port
     await db.save(project)
-    tracker.log(f"Generated {compose_rel}: services {list(services)} → routing '{web}':{port}")
+    tracker.note(
+        f"🧩 Generated stack with {len(services)} service(s): {', '.join(services.keys())} — "
+        f"routing your subdomain to '{web}'."
+    )
 
     # ── Deploy the generated stack ──
     deployed = await deploy_compose(project, tracker)
