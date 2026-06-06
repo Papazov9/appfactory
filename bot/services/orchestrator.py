@@ -521,44 +521,36 @@ async def _discard_import(project: Project):
             await db.delete(project.id)
 
 
-async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict:
-    """Create the project, clone the repo, and detect HOW it wants to be deployed.
+async def _prepare_import(bot: Bot, project: Project, repo_url: str,
+                          discard_on_clone_fail: bool) -> dict:
+    """Clone repo_url into the (empty) project dir and detect HOW to deploy it.
 
-    Deploys nothing yet — returns the next step so the caller (the /import
-    conversation) can either start the deploy or ask which service is the web
-    entry point. Outcomes:
+    Shared by begin_import (new project) and set_repo (existing project). The
+    repo is deployed AS-IS — its own docker-compose / Dockerfile is the source
+    of truth; we never generate or inject deployment files (the AI 'generate'
+    outcome only kicks in when the repo defines no deployment at all). Outcomes:
       {"outcome": "ready",      "project_id", "mode", "summary"}
       {"outcome": "choose_web", "project_id", "services": [(name, port), ...]}
-      {"outcome": "error",      "message"}                       # project discarded
-    The repo is deployed AS-IS — its own Dockerfile / docker-compose is the
-    source of truth. We never generate or inject deployment files.
+      {"outcome": "generate",   "project_id", "reason"}
+      {"outcome": "error",      "message"}
     """
-    slug = slugify(name)
-    if await db.get_by_slug(slug):
-        slug = f"{slug}-{int(asyncio.get_event_loop().time()) % 10000}"
-
-    port = await db.next_available_port()
-    project = Project(
-        name=name, slug=slug, brief=f"Imported from {repo_url}",
-        stack="", db_kind="none", app_type="", port=port,
-        telegram_chat_id=chat_id, status=ProjectStatus.PENDING,
-        repo_url=repo_url, complexity="imported",
-    )
-    project = await db.save(project)
-
     tracker = ProgressTracker(bot, project)
     gm = GitManager(project, tracker)
     try:
         info = await gm.import_repo(repo_url)
     except Exception as e:
         logger.exception(f"Import clone failed for {project.slug}")
-        await _discard_import(project)
+        if discard_on_clone_fail:
+            await _discard_import(project)
         return {"outcome": "error", "message": f"Clone failed: {e}"}
 
     if info.get("full_name"):
         project.repo_full_name = info["full_name"]
         project.default_branch = info.get("default_branch") or "main"
         project.repo_url = info.get("html_url") or repo_url
+    else:
+        project.repo_full_name = ""
+        project.repo_url = repo_url
 
     project_dir = project.project_dir
 
@@ -598,6 +590,76 @@ async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict
         reason = "no <code>Dockerfile</code> or <code>docker-compose</code> is present"
     await db.save(project)
     return {"outcome": "generate", "project_id": project.id, "reason": reason}
+
+
+async def begin_import(bot: Bot, chat_id: int, name: str, repo_url: str) -> dict:
+    """Create a NEW project from a repo URL and detect how to deploy it.
+
+    Deploys nothing yet — see _prepare_import for the outcome contract."""
+    slug = slugify(name)
+    if await db.get_by_slug(slug):
+        slug = f"{slug}-{int(asyncio.get_event_loop().time()) % 10000}"
+
+    port = await db.next_available_port()
+    project = Project(
+        name=name, slug=slug, brief=f"Imported from {repo_url}",
+        stack="", db_kind="none", app_type="", port=port,
+        telegram_chat_id=chat_id, status=ProjectStatus.PENDING,
+        repo_url=repo_url, complexity="imported",
+    )
+    project = await db.save(project)
+    return await _prepare_import(bot, project, repo_url, discard_on_clone_fail=True)
+
+
+async def set_repo(bot: Bot, project_id: int, new_repo_url: str) -> dict:
+    """Re-point an EXISTING project at a different repo (same id/subdomain), then
+    redeploy. An in-place re-import: pre-flight the new repo, tear down the old
+    deployment, wipe the working tree, clone the new repo, and re-detect how to
+    deploy it. Returns the same outcome contract as _prepare_import."""
+    project = await db.get(project_id)
+    if not project:
+        return {"outcome": "error", "message": f"Project #{project_id} not found."}
+
+    tracker = ProgressTracker(bot, project)
+
+    # Pre-flight: confirm the new repo is reachable BEFORE touching the live one,
+    # so a typo'd URL can't take the running deployment down.
+    gm = GitManager(project, tracker)
+    ok, out = await gm.remote_reachable(new_repo_url)
+    if not ok:
+        return {"outcome": "error", "message": (
+            "Can't reach that repo — check the URL and that your GITHUB_TOKEN can "
+            f"access it.\n<pre>{out[-300:]}</pre>")}
+
+    # Tear down the old deployment (keep the subdomain — it's re-routed on redeploy).
+    try:
+        if project.deploy_mode == "compose":
+            await ComposeManager(project, tracker).down(volumes=False)
+        else:
+            await DockerManager(project, tracker).stop()
+    except Exception:
+        logger.exception(f"set_repo teardown failed for {project.slug} (continuing)")
+
+    # Wipe the working tree and reset everything tied to the OLD source.
+    if project.project_dir.exists():
+        shutil.rmtree(project.project_dir, ignore_errors=True)
+    project.deploy_mode = ""
+    project.compose_file = ""
+    project.web_service = ""
+    project.web_container_port = 0
+    project.stack = ""
+    project.app_type = ""
+    project.db_kind = "none"
+    project.claude_session_id = ""
+    project.last_good_image = ""
+    project.container_id = ""
+    project.repo_full_name = ""
+    project.repo_url = new_repo_url
+    project.brief = f"Re-pointed to {new_repo_url}"
+    project.status = ProjectStatus.PENDING
+    await db.save(project)
+
+    return await _prepare_import(bot, project, new_repo_url, discard_on_clone_fail=False)
 
 
 async def finish_import(bot: Bot, project_id: int,

@@ -130,6 +130,25 @@ class GitManager:
         out = (stdout + stderr).decode("utf-8", errors="replace")
         return proc.returncode, out
 
+    async def remote_reachable(self, repo_url: str) -> tuple[bool, str]:
+        """Pre-flight: can we reach this repo (URL valid + access)? No clone.
+
+        Used by /setrepo so a bad URL is caught BEFORE tearing down a working
+        deployment. Returns (ok, scrubbed_output)."""
+        full_name, _ = self._parse_github(repo_url)
+        url = (self._token_remote(full_name)
+               if full_name and config.GITHUB_TOKEN else repo_url)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "ls-remote", url, "HEAD",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            return False, "Timed out reaching the remote (30s)."
+        text = (out + err).decode("utf-8", errors="replace")
+        return proc.returncode == 0, self._scrub(text)
+
     async def _has_git(self) -> bool:
         rc, _ = await self._git("rev-parse", "--is-inside-work-tree", check=False)
         return rc == 0

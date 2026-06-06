@@ -15,6 +15,7 @@ from telegram.ext import (
 from bot.config import config
 from bot.services.orchestrator import (
     create_project, update_project, begin_import, finish_import, generate_and_deploy_import,
+    set_repo,
 )
 from bot.services.transcriber import Transcriber
 from bot.services import stacks
@@ -33,6 +34,9 @@ UPDATE_SELECT, UPDATE_INSTRUCTIONS = 20, 21
 
 # Import flow states (adopt an existing repo for deployment)
 IMPORT_URL, IMPORT_NAME, IMPORT_WEB_SERVICE = 30, 31, 32
+
+# Set-repo flow states (re-point an existing project to a different repo)
+SETREPO_ID, SETREPO_URL = 40, 41
 
 STACK_KEYBOARD = ReplyKeyboardMarkup(
     stacks.keyboard_rows(),
@@ -610,11 +614,17 @@ async def import_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         name=name,
         repo_url=url,
     )
+    return await _handle_import_outcome(update, context, result, label=name)
+
+
+async def _handle_import_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 result: dict, label: str = "") -> int:
+    """Drive the next step after begin_import()/set_repo() — shared by /import and /setrepo."""
     outcome = result.get("outcome")
 
     if outcome == "error":
         await update.message.reply_text(
-            f"❌ {result.get('message', 'Could not import this repo.')}",
+            f"❌ {result.get('message', 'Could not deploy this repo.')}",
             parse_mode="HTML",
         )
         context.user_data.clear()
@@ -648,8 +658,9 @@ async def import_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         return IMPORT_WEB_SERVICE
 
     # outcome == "ready"
+    head = f"📥 Deploying <b>{label}</b> — " if label else "📥 Deploying — "
     await update.message.reply_text(
-        f"📥 Deploying <b>{name}</b> — {result.get('summary', '')}\n\nProgress updates below.",
+        f"{head}{result.get('summary', '')}\n\nProgress updates below.",
         parse_mode="HTML",
     )
     await finish_import(bot=context.bot, project_id=result["project_id"])
@@ -683,6 +694,100 @@ async def import_choose_web(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+#  /setrepo flow: re-point an existing project to a different repo
+# ──────────────────────────────────────────────
+
+async def setrepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /setrepo [<id>] [<new-repo-url>] — change a project's source repo."""
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
+
+    args = context.args or []
+    if args:
+        try:
+            pid = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Usage: <code>/setrepo &lt;project_id&gt; [new-repo-url]</code>",
+                                            parse_mode="HTML")
+            return ConversationHandler.END
+        project = await db.get(pid)
+        if not project:
+            await update.message.reply_text(f"Project #{pid} not found.")
+            return ConversationHandler.END
+        context.user_data["setrepo_id"] = pid
+        context.user_data["setrepo_name"] = project.name
+        if len(args) >= 2 and _looks_like_git_url(args[1].strip()):
+            return await _setrepo_run(update, context, args[1].strip())
+        await update.message.reply_text(
+            f"🔁 <b>Re-point #{pid} {project.name}</b>\n\n"
+            f"Send the <b>new</b> HTTPS Git URL to deploy from now on.\n"
+            f"<i>The old version stays up until the new repo deploys successfully.</i>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return SETREPO_URL
+
+    projects = await db.list_all()
+    if not projects:
+        await update.message.reply_text("No projects yet.")
+        return ConversationHandler.END
+    lines = ["🔁 <b>Change a project's repo</b>\n\nSend the project <b>ID</b>:\n"]
+    for p in projects:
+        lines.append(f"• <b>#{p.id}</b> — {p.name} ({p.status.value})")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    return SETREPO_ID
+
+
+async def setrepo_receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text in CANCEL_WORDS:
+        return await cancel(update, context)
+    try:
+        pid = int(text)
+    except ValueError:
+        await update.message.reply_text("Send a numeric project ID (or /cancel).")
+        return SETREPO_ID
+    project = await db.get(pid)
+    if not project:
+        await update.message.reply_text(f"Project #{pid} not found. Try again.")
+        return SETREPO_ID
+    context.user_data["setrepo_id"] = pid
+    context.user_data["setrepo_name"] = project.name
+    await update.message.reply_text(
+        f"🔁 <b>Re-point #{pid} {project.name}</b>\n\nSend the <b>new</b> HTTPS Git URL.",
+        parse_mode="HTML",
+    )
+    return SETREPO_URL
+
+
+async def setrepo_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    if url in CANCEL_WORDS:
+        return await cancel(update, context)
+    if not _looks_like_git_url(url):
+        await update.message.reply_text(
+            "That doesn't look like a Git URL. Send e.g. "
+            "<code>https://github.com/you/other-app</code> (or /cancel).",
+            parse_mode="HTML",
+        )
+        return SETREPO_URL
+    return await _setrepo_run(update, context, url)
+
+
+async def _setrepo_run(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> int:
+    pid = context.user_data.get("setrepo_id")
+    name = context.user_data.get("setrepo_name", "the project")
+    await update.message.reply_text(
+        f"🔁 Re-pointing <b>#{pid} {name}</b> to\n<code>{url}</code>\n\n"
+        f"Checking access, tearing down the old version, and redeploying. Progress below.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    result = await set_repo(bot=context.bot, project_id=pid, new_repo_url=url)
+    return await _handle_import_outcome(update, context, result, label=name)
 
 
 # ──────────────────────────────────────────────
@@ -794,6 +899,27 @@ def get_import_conversation_handler() -> ConversationHandler:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="import_flow",
+    )
+
+
+def get_setrepo_conversation_handler() -> ConversationHandler:
+    """/setrepo flow: pick project + new repo URL → in-place re-import & redeploy."""
+    return ConversationHandler(
+        entry_points=[CommandHandler("setrepo", setrepo_start)],
+        states={
+            SETREPO_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, setrepo_receive_id),
+            ],
+            SETREPO_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, setrepo_receive_url),
+            ],
+            # If the new repo is a multi-web-service compose, reuse the picker.
+            IMPORT_WEB_SERVICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_choose_web),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        name="setrepo_flow",
     )
 
 
