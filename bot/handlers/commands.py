@@ -20,19 +20,45 @@ logger = logging.getLogger(__name__)
 
 
 def auth_check(func):
-    """Decorator: only allow configured user IDs."""
+    """Decorator: FULL-access commands. Limited users are told what they can do."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if config.ALLOWED_USER_IDS and user_id not in config.ALLOWED_USER_IDS:
+        if not config.is_full_user(user_id):
+            if config.is_limited_user(user_id):
+                await update.message.reply_text(
+                    "⛔ You don't have permission for that. Your account can only use "
+                    "/list and /redeploy."
+                )
+            else:
+                await update.message.reply_text("⛔ Unauthorized.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def auth_check_any(func):
+    """Decorator: commands allowed for FULL and LIMITED users (e.g. /list, /redeploy)."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not config.is_authorized(user_id):
             await update.message.reply_text("⛔ Unauthorized.")
             return
         return await func(update, context)
     return wrapper
 
 
-@auth_check
+@auth_check_any
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
+    """Handle /start command. Limited users see a reduced help screen."""
+    if not config.is_full_user(update.effective_user.id):
+        await update.message.reply_text(
+            "🏭 <b>AppFactory Bot</b>\n\n"
+            "Your account has <b>deploy-only</b> access:\n\n"
+            "/list — List all projects\n"
+            "/redeploy &lt;id&gt; — Pull the latest pushed code and redeploy a project\n",
+            parse_mode="HTML",
+        )
+        return
     await update.message.reply_text(
         "🏭 <b>AppFactory Bot</b>\n\n"
         "I turn project briefs into live web apps using AI agents.\n\n"
@@ -60,9 +86,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@auth_check
+@auth_check_any
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /list — show all projects."""
+    """Handle /list — show all projects. Allowed for limited users too."""
     projects = await db.list_all()
     if not projects:
         await update.message.reply_text("No projects yet. Use /new to create one.")
@@ -240,9 +266,9 @@ async def cmd_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@auth_check
+@auth_check_any
 async def cmd_redeploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /redeploy <id> — pull latest from Git and redeploy (no AI)."""
+    """Handle /redeploy <id> — pull latest from Git and redeploy (no AI). Limited users too."""
     project = await _get_project_from_args(update, context)
     if not project:
         return

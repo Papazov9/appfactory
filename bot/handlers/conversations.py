@@ -55,11 +55,31 @@ DONE_WORDS = {"✅ Done", "Done", "done", "🚀 Build it!"}
 CANCEL_WORDS = {"❌ Cancel", "Cancel", "cancel"}
 
 
+async def _deny_if_not_full(update: Update) -> bool:
+    """Entry guard for conversations (create/voice/update/import are full-access only).
+
+    Returns True (after replying) when the user lacks full access, so the caller
+    should end the conversation. Limited users (list+redeploy only) and unknown
+    users are blocked here."""
+    user_id = update.effective_user.id
+    if config.is_full_user(user_id):
+        return False
+    if config.is_limited_user(user_id):
+        await update.message.reply_text(
+            "⛔ Your account can only use /list and /redeploy."
+        )
+    else:
+        await update.message.reply_text("⛔ Unauthorized.")
+    return True
+
+
 # ──────────────────────────────────────────────
 #  Standard /new flow (text-based)
 # ──────────────────────────────────────────────
 
 async def new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
     await update.message.reply_text(
         "🏭 <b>New Project</b>\n\n"
         "What's the project name?\n"
@@ -200,6 +220,8 @@ async def receive_brief_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ──────────────────────────────────────────────
 
 async def voice_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
     # If they sent a voice message directly (no /voice command first)
     if update.message.voice or update.message.audio:
         return await voice_receive(update, context)
@@ -215,6 +237,8 @@ async def voice_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def voice_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
     msg = await update.message.reply_text("🎙️ Transcribing...")
 
     transcript = await _handle_voice(update)
@@ -340,6 +364,8 @@ async def voice_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /update — pick a project then give instructions."""
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
     # If they passed an ID directly: /update 3
     if context.args:
         try:
@@ -510,6 +536,8 @@ def _looks_like_git_url(url: str) -> bool:
 
 async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /import — adopt an already-built repo and deploy it by subdomain."""
+    if await _deny_if_not_full(update):
+        return ConversationHandler.END
     # Allow `/import <url>` to skip straight to the name step.
     if context.args and _looks_like_git_url(context.args[0].strip()):
         context.user_data["import_url"] = context.args[0].strip()

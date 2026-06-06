@@ -8,9 +8,17 @@ load_dotenv()
 class Config:
     # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    # Full-access users — can do everything.
     ALLOWED_USER_IDS: list[int] = [
         int(uid.strip())
         for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
+        if uid.strip()
+    ]
+    # Limited users — may ONLY /list and /redeploy projects (no create/update/
+    # import/delete/stop/etc.). Useful for an ops/deploy helper account.
+    LIMITED_USER_IDS: list[int] = [
+        int(uid.strip())
+        for uid in os.getenv("LIMITED_USER_IDS", "").split(",")
         if uid.strip()
     ]
 
@@ -71,6 +79,19 @@ class Config:
     def github_enabled(self) -> bool:
         """True when GitHub repo creation/push is configured."""
         return bool(self.GITHUB_TOKEN and self.GITHUB_OWNER)
+
+    # ── Authorization roles ──────────────────
+    def is_full_user(self, user_id: int) -> bool:
+        """Full access. (Empty ALLOWED_USER_IDS means unrestricted — legacy behaviour.)"""
+        return (not self.ALLOWED_USER_IDS) or user_id in self.ALLOWED_USER_IDS
+
+    def is_limited_user(self, user_id: int) -> bool:
+        """Limited access — may only /list and /redeploy."""
+        return user_id in self.LIMITED_USER_IDS
+
+    def is_authorized(self, user_id: int) -> bool:
+        """Known to the bot at all (full or limited)."""
+        return self.is_full_user(user_id) or self.is_limited_user(user_id)
 
 
 config = Config()
